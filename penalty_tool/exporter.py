@@ -424,6 +424,224 @@ class CaseExporter:
         self._write_file(output_path, json.dumps(export_data, ensure_ascii=False, indent=2))
         return os.path.abspath(output_path)
 
+    # ========== 横向对比导出 ==========
+
+    def export_comparison(self, case_ids: List[int], output_path: str,
+                          title: Optional[str] = None,
+                          format_type: str = "md") -> str:
+        """
+        多案例横向对比清单导出
+
+        Args:
+            case_ids: 案例ID列表
+            output_path: 输出文件路径
+            title: 文档标题
+            format_type: 导出格式：md / txt / json
+        """
+        valid_formats = {"md", "txt", "json"}
+        if format_type not in valid_formats:
+            raise ValueError(f"不支持的格式: {format_type}，支持: {', '.join(sorted(valid_formats))}")
+
+        if not case_ids or len(case_ids) < 2:
+            raise ValueError("横向对比至少需要2个案例")
+
+        cases = self.db.get_cases_export(case_ids)
+        if not cases:
+            raise ValueError("未找到可导出的案例")
+
+        title = title or "监管处罚案例对比清单"
+        dimensions_list = [self._build_comparison_dimensions(c) for c in cases]
+
+        if format_type == "md":
+            content = self._export_comparison_md(dimensions_list, title)
+        elif format_type == "txt":
+            content = self._export_comparison_txt(dimensions_list, title)
+        else:
+            content = self._export_comparison_json(dimensions_list, title)
+
+        self._write_file(output_path, content)
+        return os.path.abspath(output_path)
+
+    def _build_comparison_dimensions(self, case: Dict) -> Dict:
+        """从案例数据中提取横向对比维度"""
+        facts = mask_sensitive_info(self._sanitize(case.get("facts", "")))
+        defense = mask_sensitive_info(self._sanitize(case.get("defense_content", "")))
+        rectification = mask_sensitive_info(self._sanitize(case.get("rectification_report", "")))
+
+        facts_display = facts[:200] + ("..." if len(facts) > 200 else "") if facts else ""
+
+        defense_items = self._extract_key_points_plain(defense) if defense else []
+        rectification_items = self._extract_action_items_plain(rectification) if rectification else []
+
+        return {
+            "case_no": case.get("case_no", ""),
+            "company": self._sanitize(case.get("company", "")),
+            "regulator": self._sanitize(case.get("regulator", "")),
+            "penalty_date": case.get("penalty_date", "未公开"),
+            "penalty_amount": case.get("penalty_amount", 0),
+            "penalty_amount_formatted": format_amount(case.get("penalty_amount", 0)),
+            "facts": facts_display,
+            "defense_items": defense_items,
+            "rectification_items": rectification_items,
+        }
+
+    def _export_comparison_md(self, dimensions_list: List[Dict], title: str) -> str:
+        """Markdown格式横向对比"""
+        generated_at = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        lines = []
+
+        lines.append(f"# {title}")
+        lines.append("")
+        lines.append(f"> 生成时间：{generated_at}")
+        lines.append(f"> 案例数量：{len(dimensions_list)} 个")
+        lines.append(f"> 说明：本清单已脱敏处理，隐藏了内部敏感信息。")
+        lines.append("")
+
+        dim_labels = [
+            ("所属公司", "company"),
+            ("监管部门", "regulator"),
+            ("处罚日期", "penalty_date"),
+            ("处罚金额", "penalty_amount_formatted"),
+            ("违法事实", "facts"),
+        ]
+
+        header = "| 维度 | " + " | ".join(
+            [f"案例{i+1}: {d['case_no']}" for i, d in enumerate(dimensions_list)]
+        ) + " |"
+        separator = "|------|" + "|".join(["------" for _ in dimensions_list]) + " |"
+
+        lines.append(header)
+        lines.append(separator)
+
+        for label, key in dim_labels:
+            row_values = []
+            for d in dimensions_list:
+                val = d[key]
+                val = str(val).replace("|", "｜").replace("\n", " ")
+                row_values.append(val)
+            lines.append("| " + label + " | " + " | ".join(row_values) + " |")
+
+        defense_row_values = []
+        for d in dimensions_list:
+            items = d["defense_items"]
+            if items:
+                cell = "<br>".join([f"- {it}".replace("|", "｜") for it in items])
+            else:
+                cell = d["facts"][:80] + "..." if d["facts"] else "无"
+            defense_row_values.append(cell)
+        lines.append("| 申辩要点 | " + " | ".join(defense_row_values) + " |")
+
+        rect_row_values = []
+        for d in dimensions_list:
+            items = d["rectification_items"]
+            if items:
+                cell = "<br>".join([f"- {it}".replace("|", "｜") for it in items])
+            else:
+                cell = "无"
+            rect_row_values.append(cell)
+        lines.append("| 整改动作 | " + " | ".join(rect_row_values) + " |")
+
+        lines.append("")
+        lines.append("*本清单仅供内部参考，请勿对外传播。*")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def _export_comparison_txt(self, dimensions_list: List[Dict], title: str) -> str:
+        """纯文本格式横向对比"""
+        generated_at = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+        separator = "=" * 78
+        lines = []
+
+        lines.append(separator)
+        lines.append(f"  {title}")
+        lines.append(separator)
+        lines.append(f"  生成时间：{generated_at}")
+        lines.append(f"  案例数量：{len(dimensions_list)} 个")
+        lines.append("  说明：本清单已脱敏处理，隐藏了内部敏感信息。")
+        lines.append(separator)
+        lines.append("")
+
+        dim_labels = [
+            ("所属公司", "company"),
+            ("监管部门", "regulator"),
+            ("处罚日期", "penalty_date"),
+            ("处罚金额", "penalty_amount_formatted"),
+            ("违法事实", "facts"),
+        ]
+
+        case_labels = [f"案例{i+1}: {d['case_no']}" for i, d in enumerate(dimensions_list)]
+        max_label_w = 10
+        col_width = 28
+
+        header_line = " " * (max_label_w + 2) + "  ".join(
+            [lbl.ljust(col_width) for lbl in case_labels]
+        )
+        lines.append(header_line)
+        lines.append("-" * len(header_line))
+
+        for label, key in dim_labels:
+            row_parts = []
+            for d in dimensions_list:
+                val = str(d[key]).replace("\n", " ")
+                row_parts.append(val[:col_width].ljust(col_width))
+            lines.append(label.ljust(max_label_w) + "  " + "  ".join(row_parts))
+
+        lines.append("")
+
+        for i, d in enumerate(dimensions_list):
+            label = f"案例{i+1}: {d['case_no']}"
+            lines.append(f"  ▌ {label} - 申辩要点")
+            items = d["defense_items"]
+            if items:
+                for item in items:
+                    lines.append(self._indent_text(f"- {item}", 6))
+            else:
+                lines.append(self._indent_text("无", 6))
+            lines.append("")
+
+            lines.append(f"  ▌ {label} - 整改动作")
+            items = d["rectification_items"]
+            if items:
+                for item in items:
+                    lines.append(self._indent_text(f"- {item}", 6))
+            else:
+                lines.append(self._indent_text("无", 6))
+            lines.append("")
+
+        lines.append(separator)
+        lines.append("【注意】本清单仅供内部参考，请勿对外传播。")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def _export_comparison_json(self, dimensions_list: List[Dict], title: str) -> str:
+        """JSON格式横向对比"""
+        export_data = {
+            "title": title,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "case_count": len(dimensions_list),
+            "cases": []
+        }
+
+        for d in dimensions_list:
+            case_data = {
+                "case_no": d["case_no"],
+                "comparison_dimensions": {
+                    "company": d["company"],
+                    "regulator": d["regulator"],
+                    "penalty_date": d["penalty_date"],
+                    "penalty_amount": d["penalty_amount"],
+                    "penalty_amount_formatted": d["penalty_amount_formatted"],
+                    "facts": d["facts"],
+                    "defense_key_points": d["defense_items"],
+                    "rectification_actions": d["rectification_items"],
+                }
+            }
+            export_data["cases"].append(case_data)
+
+        return json.dumps(export_data, ensure_ascii=False, indent=2)
+
     # ========== 辅助方法 ==========
 
     def auto_export_path(self, output_dir: Optional[str] = None,

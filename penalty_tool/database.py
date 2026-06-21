@@ -62,6 +62,26 @@ class PenaltyDatabase:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS saved_searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    description TEXT,
+                    keywords TEXT,
+                    company TEXT,
+                    regulator TEXT,
+                    business_line TEXT,
+                    tags TEXT,
+                    min_amount REAL,
+                    max_amount REAL,
+                    from_date TEXT,
+                    to_date TEXT,
+                    sort_by TEXT DEFAULT 'penalty_date',
+                    sort_order TEXT DEFAULT 'desc',
+                    created_at TEXT NOT NULL
+                )
+            """)
+
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_penalties_company ON penalties(company)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_penalties_regulator ON penalties(regulator)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_penalties_business_line ON penalties(business_line)")
@@ -494,3 +514,141 @@ class PenaltyDatabase:
                 "company_count": company_count,
                 "regulator_count": regulator_count,
             }
+
+    # ========== 保存的检索条件 ==========
+
+    def save_search(self, name: str, description: str = "",
+                    keywords: Optional[List[str]] = None,
+                    company: Optional[str] = None,
+                    regulator: Optional[str] = None,
+                    business_line: Optional[str] = None,
+                    tags: Optional[List[str]] = None,
+                    min_amount: Optional[float] = None,
+                    max_amount: Optional[float] = None,
+                    from_date: Optional[str] = None,
+                    to_date: Optional[str] = None,
+                    sort_by: str = "penalty_date",
+                    sort_order: str = "desc") -> Tuple[bool, str]:
+        """保存检索条件"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        keywords_json = json.dumps(keywords or [], ensure_ascii=False)
+        tags_json = json.dumps(tags or [], ensure_ascii=False)
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO saved_searches
+                    (name, description, keywords, company, regulator, business_line,
+                     tags, min_amount, max_amount, from_date, to_date,
+                     sort_by, sort_order, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, description, keywords_json, company, regulator,
+                      business_line, tags_json, min_amount, max_amount,
+                      from_date, to_date, sort_by, sort_order, now))
+                conn.commit()
+                return True, f"检索条件 '{name}' 已保存"
+        except Exception as e:
+            return False, f"保存失败: {e}"
+
+    def load_search(self, name: str) -> Optional[Dict]:
+        """按名称加载保存的检索条件"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM saved_searches WHERE name = ?", (name,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            for field in ["keywords", "tags"]:
+                if data.get(field):
+                    try:
+                        data[field] = json.loads(data[field])
+                    except:
+                        data[field] = []
+            return data
+
+    def list_saved_searches(self) -> List[Dict]:
+        """列出所有保存的检索条件"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM saved_searches ORDER BY created_at DESC")
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                data = dict(row)
+                for field in ["keywords", "tags"]:
+                    if data.get(field):
+                        try:
+                            data[field] = json.loads(data[field])
+                        except:
+                            data[field] = []
+                results.append(data)
+            return results
+
+    def delete_saved_search(self, name: str) -> bool:
+        """删除保存的检索条件"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM saved_searches WHERE name = ?", (name,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except:
+            return False
+
+    # ========== 资料库健康检查 ==========
+
+    def health_check(self) -> Dict:
+        """检查资料库中数据完整性，返回缺失字段统计"""
+        issues = {
+            "missing_date": [],
+            "missing_amount": [],
+            "missing_facts": [],
+            "missing_tags": [],
+            "summary": {},
+        }
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT id, case_no, company, regulator FROM penalties
+                WHERE penalty_date IS NULL OR penalty_date = ''
+            """)
+            for row in cursor.fetchall():
+                issues["missing_date"].append(dict(row))
+
+            cursor.execute("""
+                SELECT id, case_no, company, regulator FROM penalties
+                WHERE penalty_amount IS NULL OR penalty_amount = 0
+            """)
+            for row in cursor.fetchall():
+                issues["missing_amount"].append(dict(row))
+
+            cursor.execute("""
+                SELECT id, case_no, company, regulator FROM penalties
+                WHERE facts IS NULL OR facts = ''
+            """)
+            for row in cursor.fetchall():
+                issues["missing_facts"].append(dict(row))
+
+            cursor.execute("""
+                SELECT id, case_no, company, regulator FROM penalties
+                WHERE tags IS NULL OR tags = '' OR tags = '[]'
+            """)
+            for row in cursor.fetchall():
+                issues["missing_tags"].append(dict(row))
+
+            cursor.execute("SELECT COUNT(*) as total FROM penalties")
+            total = cursor.fetchone()["total"]
+
+        issues["summary"] = {
+            "total_cases": total,
+            "missing_date_count": len(issues["missing_date"]),
+            "missing_amount_count": len(issues["missing_amount"]),
+            "missing_facts_count": len(issues["missing_facts"]),
+            "missing_tags_count": len(issues["missing_tags"]),
+        }
+
+        return issues

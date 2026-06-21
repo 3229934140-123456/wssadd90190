@@ -474,6 +474,7 @@ class DocumentImporter:
             _print("  案件分组预览")
             _print("=" * 60)
 
+            file_counter = 1
             for g in groups:
                 type_labels = []
                 if g["has_penalty"]:
@@ -488,12 +489,13 @@ class DocumentImporter:
                     from .utils import format_amount
                     amount_str = f" | 预估金额: {format_amount(g['amount'])}"
 
-                _print(f"\n  [{g['id']:>2}] {g['display_name']}")
-                _print(f"      类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}")
-                _print(f"      文件 ({len(g['files'])} 个):")
+                _print(f"\n  组{g['id']} [{g['display_name']}]:")
+                _print(f"    类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}")
+                _print(f"    文件 ({len(g['files'])} 个):")
                 for f in g["files"]:
                     type_icon = {"penalty": "📄", "defense": "💬", "rectification": "📋"}.get(f["type"], "📎")
-                    _print(f"        {type_icon} {f['name']}")
+                    _print(f"      F{file_counter} {type_icon} {f['name']}")
+                    file_counter += 1
 
             _print()
             _print("  操作选项:")
@@ -502,7 +504,7 @@ class DocumentImporter:
             _print("    s <组号> - 拆分某个分组（每个文件独立成组）")
             _print("    r <组号> <新名称> - 重命名分组")
             _print("    d <组号> - 删除/跳过某个分组")
-            _print("    mv <文件号> <目标组号> - 移动文件到另一组")
+            _print("    mv F<n> <目标组号> - 移动文件到另一组（如 mv F1 2）")
             _print("    q - 取消导入")
             _print()
 
@@ -558,13 +560,17 @@ class DocumentImporter:
                 parts = choice[3:].split()
                 if len(parts) >= 2:
                     try:
-                        file_idx = int(parts[0])
+                        file_ref = parts[0]
+                        if file_ref.upper().startswith("F"):
+                            file_idx = int(file_ref[1:])
+                        else:
+                            file_idx = int(file_ref)
                         target_id = int(parts[1])
                         groups = self._move_file_between_groups(groups, file_idx, target_id)
                     except ValueError:
-                        _print("  ! 请输入有效的文件序号和目标组号")
+                        _print("  ! 请输入有效的文件编号和目标组号，如 mv F1 2")
                 else:
-                    _print("  ! 格式：mv <文件序号> <目标组号>")
+                    _print("  ! 格式：mv F<n> <目标组号>，如 mv F1 2")
 
             elif choice == "q":
                 return []
@@ -622,9 +628,26 @@ class DocumentImporter:
         groups.extend(new_groups)
         return self._renumber_groups(groups)
 
+    def _refresh_group_stats(self, group: Dict):
+        """重新计算分组的统计信息（has_penalty/has_defense/has_rectification/amount）"""
+        group["doc_types"] = {f["type"] for f in group["files"]}
+        group["has_penalty"] = "penalty" in group["doc_types"]
+        group["has_defense"] = "defense" in group["doc_types"]
+        group["has_rectification"] = "rectification" in group["doc_types"]
+        group["amount"] = None
+        group["summary"] = ""
+        for f in group["files"]:
+            if f["type"] == "penalty":
+                if not group["amount"]:
+                    amount = extract_amount_from_text(f["content"])
+                    if amount:
+                        group["amount"] = amount
+                if not group["summary"]:
+                    group["summary"] = generate_summary(f["content"], 200)
+
     def _move_file_between_groups(self, groups: List[Dict],
                                   file_global_idx: int, target_id: int) -> List[Dict]:
-        """在分组间移动文件（按全局文件序号）"""
+        """在分组间移动文件（按全局文件编号 F1, F2...）"""
         all_files = []
         for g in groups:
             for f in g["files"]:
@@ -640,21 +663,13 @@ class DocumentImporter:
             return groups
 
         src_group["files"].remove(file_info)
-        if not src_group["files"]:
-            groups = [g for g in groups if g["id"] != src_group["id"]]
-
         tgt_group["files"].append(file_info)
-        tgt_group["doc_types"].add(file_info["type"])
-        if file_info["type"] == "penalty":
-            tgt_group["has_penalty"] = True
-            if not tgt_group["amount"]:
-                amount = extract_amount_from_text(file_info["content"])
-                if amount:
-                    tgt_group["amount"] = amount
-        elif file_info["type"] == "defense":
-            tgt_group["has_defense"] = True
-        elif file_info["type"] == "rectification":
-            tgt_group["has_rectification"] = True
+
+        self._refresh_group_stats(tgt_group)
+        if src_group["files"]:
+            self._refresh_group_stats(src_group)
+        else:
+            groups = [g for g in groups if g["id"] != src_group["id"]]
 
         return self._renumber_groups(groups)
 
@@ -665,29 +680,23 @@ class DocumentImporter:
         return groups
 
     def _collect_common_metadata(self, _input: Callable, _print: Callable) -> Optional[Dict]:
-        """收集通用元数据"""
+        """收集默认元数据（作为各分组的默认值，只问一次）"""
         _print()
         _print("=" * 60)
-        _print("  录入案件通用元数据")
+        _print("  录入默认元数据（按回车可跳过，后续每个分组可单独修改）")
         _print("=" * 60)
 
         data = {}
-        data["company"] = _input("  所属公司 (必填): ").strip()
-        if not data["company"]:
-            _print("  ! 所属公司为必填项")
-            return None
-
         data["regulator"] = _input("  监管部门 (必填): ").strip()
         if not data["regulator"]:
             _print("  ! 监管部门为必填项")
             return None
 
-        data["business_line"] = _input("  业务线 (可选): ").strip()
-
-        tags_input = _input("  案件标签 (逗号分隔，如：广告法,绝对化用语): ").strip()
+        data["company"] = _input("  默认所属公司: ").strip()
+        data["business_line"] = _input("  默认业务线: ").strip()
+        tags_input = _input("  默认案件标签 (逗号分隔): ").strip()
         data["tags"] = parse_input_list(tags_input)
-
-        penalty_date = _input("  处罚日期 (可选，YYYY-MM-DD): ").strip()
+        penalty_date = _input("  默认处罚日期 (YYYY-MM-DD): ").strip()
         data["penalty_date"] = penalty_date or None
 
         return data
@@ -737,29 +746,34 @@ class DocumentImporter:
             _print(f"  关联文件: {', '.join(case_data['source_files'][:3])}"
                    + ("..." if len(case_data['source_files']) > 3 else ""))
 
-            edit = _input("  编辑此案件的字段？(y/N): ").strip().lower()
-            if edit == "y":
-                case_data["company"] = _input(f"    所属公司 [{case_data['company']}]: ").strip() or case_data["company"]
-                case_data["regulator"] = _input(f"    监管部门 [{case_data['regulator']}]: ").strip() or case_data["regulator"]
-                new_biz = _input(f"    业务线 [{case_data.get('business_line', '')}]: ").strip()
-                if new_biz:
-                    case_data["business_line"] = new_biz
+            default_company = common_data.get("company", "")
+            default_biz = common_data.get("business_line", "")
+            default_tags = common_data.get("tags", [])
+            default_date = common_data.get("penalty_date", "")
 
-                new_tags = _input(f"    标签 [{', '.join(case_data.get('tags', []))}]: ").strip()
-                if new_tags:
-                    case_data["tags"] = parse_input_list(new_tags)
+            company = _input(f"  所属公司 [{default_company}]: ").strip()
+            case_data["company"] = company or default_company
 
-                new_date = _input(f"    处罚日期 [{case_data.get('penalty_date', '')}]: ").strip()
-                if new_date:
-                    case_data["penalty_date"] = new_date
+            biz = _input(f"  业务线/部门 [{default_biz}]: ").strip()
+            case_data["business_line"] = biz or default_biz
 
-                amount = case_data.get("penalty_amount", 0)
-                new_amount = _input(f"    处罚金额 [{amount}元]: ").strip()
-                if new_amount:
-                    try:
-                        case_data["penalty_amount"] = float(new_amount)
-                    except ValueError:
-                        pass
+            tags_str = ", ".join(default_tags) if default_tags else ""
+            new_tags = _input(f"  案件标签 [{tags_str}]: ").strip()
+            if new_tags:
+                case_data["tags"] = parse_input_list(new_tags)
+            else:
+                case_data["tags"] = list(default_tags)
+
+            date = _input(f"  处罚日期 [{default_date or ''}]: ").strip()
+            case_data["penalty_date"] = date or default_date
+
+            amount = case_data.get("penalty_amount", 0)
+            new_amount = _input(f"  处罚金额 [{amount}元]: ").strip()
+            if new_amount:
+                try:
+                    case_data["penalty_amount"] = float(new_amount)
+                except ValueError:
+                    pass
 
             reference = _input("  可借鉴话术 (可选): ").strip()
             if reference:
