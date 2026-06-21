@@ -597,6 +597,227 @@ class PenaltyDatabase:
         except:
             return False
 
+    # ========== 相似案例查找 ==========
+
+    def find_similar_cases(self, case_id: int, limit: int = 10) -> List[Dict]:
+        """
+        查找与目标案例相似的其他案例
+
+        评分维度：
+        - 标签重叠分：Jaccard 相似度（0-3分，若目标无标签则跳过）
+        - 监管部门匹配：完全相同 +3 分，部分包含 +1 分
+        - 金额相似度：1 - |a-b|/max(|a|,|b|,1)，取 0-3 分
+        - 事实关键词重叠：facts 中文2字以上词的 Jaccard，取 0-3 分
+
+        Returns:
+            按总分倒序的案例列表，每项包含：id, case_no, company, regulator,
+            penalty_amount, score, reasons
+        """
+        import re
+
+        target = self.get_case_by_id(case_id)
+        if not target:
+            return []
+
+        target_tags = set(target.get("tags") or [])
+        target_regulator = (target.get("regulator") or "").strip()
+        target_amount = float(target.get("penalty_amount") or 0)
+        target_facts = target.get("facts") or ""
+
+        def _extract_chinese_words(text: str) -> set:
+            if not text:
+                return set()
+            return set(re.findall(r"[\u4e00-\u9fa5]{2,}", text))
+
+        target_fact_words = _extract_chinese_words(target_facts)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, case_no, company, regulator, tags, penalty_amount, facts
+                FROM penalties
+                WHERE id != ?
+            """, (case_id,))
+            rows = cursor.fetchall()
+
+        scored = []
+        for row in rows:
+            item = dict(row)
+            case_tags = set()
+            if item.get("tags"):
+                try:
+                    case_tags = set(json.loads(item["tags"]))
+                except:
+                    pass
+            case_regulator = (item.get("regulator") or "").strip()
+            case_amount = float(item.get("penalty_amount") or 0)
+            case_facts = item.get("facts") or ""
+            case_fact_words = _extract_chinese_words(case_facts)
+
+            total_score = 0.0
+            reasons = []
+
+            if target_tags:
+                tag_inter = target_tags & case_tags
+                tag_union = target_tags | case_tags
+                if tag_union:
+                    tag_jaccard = len(tag_inter) / len(tag_union)
+                    tag_score = tag_jaccard * 3
+                    total_score += tag_score
+                    if tag_score > 0:
+                        reasons.append(f"标签相似 ({', '.join(sorted(tag_inter)[:3])}) +{tag_score:.1f}")
+
+            if target_regulator and case_regulator:
+                if target_regulator == case_regulator:
+                    total_score += 3
+                    reasons.append(f"监管部门相同 +3")
+                elif target_regulator in case_regulator or case_regulator in target_regulator:
+                    total_score += 1
+                    reasons.append(f"监管部门相关 +1")
+
+            denom = max(abs(target_amount), abs(case_amount), 1)
+            amount_sim = 1 - abs(target_amount - case_amount) / denom
+            amount_sim = max(0.0, min(1.0, amount_sim))
+            amount_score = amount_sim * 3
+            total_score += amount_score
+            if amount_score > 0.5:
+                reasons.append(f"金额相近 +{amount_score:.1f}")
+
+            if target_fact_words and case_fact_words:
+                word_inter = target_fact_words & case_fact_words
+                word_union = target_fact_words | case_fact_words
+                if word_union:
+                    word_jaccard = len(word_inter) / len(word_union)
+                    word_score = word_jaccard * 3
+                    total_score += word_score
+                    if word_score > 0:
+                        reasons.append(f"事实关键词相似 ({', '.join(sorted(word_inter)[:3])}) +{word_score:.1f}")
+
+            scored.append({
+                "id": item["id"],
+                "case_no": item.get("case_no", ""),
+                "company": item.get("company", ""),
+                "regulator": case_regulator,
+                "penalty_amount": case_amount,
+                "score": round(total_score, 2),
+                "reasons": reasons,
+            })
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
+
+    # ========== 批量从CSV更新 ==========
+
+    def batch_update_from_csv(self, csv_path: str) -> Tuple[int, List[str]]:
+        """
+        读取CSV，根据 case_no 查找案例，对每行非空的 *_new 列更新对应字段
+
+        映射关系：
+          penalty_date_new   -> penalty_date
+          penalty_amount_new -> penalty_amount
+          facts_new          -> facts
+          tags_new           -> tags（逗号分隔）
+
+        Returns:
+            (updated_count, errors)
+        """
+        import csv
+
+        errors = []
+        updated_count = 0
+
+        if not os.path.exists(csv_path):
+            return 0, [f"CSV 文件不存在: {csv_path}"]
+
+        field_mapping = {
+            "penalty_date_new": "penalty_date",
+            "penalty_amount_new": "penalty_amount",
+            "facts_new": "facts",
+            "tags_new": "tags",
+        }
+
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row_num, row in enumerate(reader, start=2):
+                    case_no = (row.get("case_no") or "").strip()
+                    if not case_no:
+                        errors.append(f"第 {row_num} 行: case_no 为空，跳过")
+                        continue
+
+                    case = self.get_case_by_no(case_no)
+                    if not case:
+                        errors.append(f"第 {row_num} 行: 未找到案例 {case_no}，跳过")
+                        continue
+
+                    updates = {}
+                    for csv_col, db_field in field_mapping.items():
+                        val = row.get(csv_col)
+                        if val is None:
+                            continue
+                        val = str(val).strip()
+                        if not val:
+                            continue
+                        if db_field == "penalty_amount":
+                            try:
+                                val_clean = val.replace(",", "").replace("元", "")
+                                if val_clean.endswith("万"):
+                                    updates[db_field] = float(val_clean[:-1]) * 10000
+                                else:
+                                    updates[db_field] = float(val_clean)
+                            except ValueError:
+                                errors.append(f"第 {row_num} 行 ({case_no}): 金额格式错误 '{val}'，跳过该字段")
+                                continue
+                        elif db_field == "tags":
+                            updates[db_field] = [t.strip() for t in val.replace("，", ",").split(",") if t.strip()]
+                        else:
+                            updates[db_field] = val
+
+                    if updates:
+                        self._update_case_fields_internal(case["id"], updates)
+                        updated_count += 1
+        except Exception as e:
+            errors.append(f"读取 CSV 失败: {e}")
+
+        return updated_count, errors
+
+    def _update_case_fields_internal(self, case_id: int, updates: dict):
+        """内部方法：更新案例字段（与 main.py 中 _update_case_fields 类似）"""
+        import json as json_mod
+        from datetime import datetime
+
+        set_parts = []
+        params = []
+
+        for field, value in updates.items():
+            if field == "tags":
+                if isinstance(value, list):
+                    tags_json = json_mod.dumps(value, ensure_ascii=False)
+                    set_parts.append("tags = ?")
+                    params.append(tags_json)
+                    with self._get_connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM case_tags WHERE case_id = ?", (case_id,))
+                        for tag in value:
+                            cursor.execute("INSERT INTO case_tags (case_id, tag) VALUES (?, ?)", (case_id, tag))
+                        conn.commit()
+                continue
+            set_parts.append(f"{field} = ?")
+            params.append(value)
+
+        if not set_parts:
+            return
+
+        set_parts.append("updated_at = ?")
+        params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(case_id)
+
+        sql = f"UPDATE penalties SET {', '.join(set_parts)} WHERE id = ?"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            conn.commit()
+
     # ========== 资料库健康检查 ==========
 
     def health_check(self) -> Dict:

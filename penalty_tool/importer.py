@@ -3,6 +3,7 @@
 import os
 import re
 from typing import List, Dict, Optional, Callable, Tuple
+from collections import Counter
 from .database import PenaltyDatabase
 from .utils import (
     scan_document_folder,
@@ -12,6 +13,33 @@ from .utils import (
     parse_input_list,
     SUPPORTED_EXTENSIONS,
 )
+
+REGULATOR_KEYWORDS = {
+    "市监局": "市场监督管理局",
+    "市场监管": "市场监督管理局",
+    "市场监督管理局": "市场监督管理局",
+    "工商局": "工商行政管理局",
+    "网信办": "国家互联网信息办公室",
+    "互联网信息": "国家互联网信息办公室",
+    "人社局": "人力资源和社会保障局",
+    "人力资源": "人力资源和社会保障局",
+    "劳动": "人力资源和社会保障局",
+    "税务局": "税务局",
+    "税务": "税务局",
+    "央行": "中国人民银行",
+    "人民银行": "中国人民银行",
+    "银保监": "银保监会",
+    "银监会": "银保监会",
+    "证监": "证监会",
+    "应急管理": "应急管理局",
+    "消防": "应急管理局",
+    "生态环境": "生态环境局",
+    "环保": "生态环境局",
+    "公安": "公安局",
+    "住建": "住房和城乡建设局",
+    "卫健": "卫生健康委员会",
+    "卫生": "卫生健康委员会",
+}
 
 
 class DocumentImporter:
@@ -96,6 +124,21 @@ class DocumentImporter:
                 data["result_summary"] = summary
 
         return data
+
+    def _extract_regulator_from_content(self, content: str) -> Optional[str]:
+        """
+        从文档内容中提取监管部门
+        遍历 REGULATOR_KEYWORDS，最长匹配优先
+        """
+        if not content:
+            return None
+
+        sorted_keywords = sorted(REGULATOR_KEYWORDS.keys(), key=len, reverse=True)
+        for keyword in sorted_keywords:
+            if keyword in content:
+                return REGULATOR_KEYWORDS[keyword]
+
+        return None
 
     # ========== v1 导入方法（保留兼容性） ==========
 
@@ -363,6 +406,7 @@ class DocumentImporter:
                     "has_rectification": False,
                     "amount": None,
                     "summary": "",
+                    "suggested_regulator": None,
                 }
 
             file_info = {
@@ -386,6 +430,20 @@ class DocumentImporter:
                 groups_dict[group_key]["has_defense"] = True
             elif doc_type == "rectification":
                 groups_dict[group_key]["has_rectification"] = True
+
+        for group in groups_dict.values():
+            regulator_candidates = []
+            for f in group["files"]:
+                if f["type"] == "penalty":
+                    reg = self._extract_regulator_from_content(f["content"])
+                    if reg:
+                        regulator_candidates.append(reg)
+                    reg_from_name = self._extract_regulator_from_content(f["name"])
+                    if reg_from_name:
+                        regulator_candidates.append(reg_from_name)
+            if regulator_candidates:
+                counter = Counter(regulator_candidates)
+                group["suggested_regulator"] = counter.most_common(1)[0][0]
 
         groups = list(groups_dict.values())
 
@@ -458,6 +516,14 @@ class DocumentImporter:
                             groups[i]["amount"] = groups[j]["amount"]
                         if not groups[i]["summary"] and groups[j]["summary"]:
                             groups[i]["summary"] = groups[j]["summary"]
+                        merged_regulators = []
+                        if groups[i].get("suggested_regulator"):
+                            merged_regulators.append(groups[i]["suggested_regulator"])
+                        if groups[j].get("suggested_regulator"):
+                            merged_regulators.append(groups[j]["suggested_regulator"])
+                        if merged_regulators:
+                            counter = Counter(merged_regulators)
+                            groups[i]["suggested_regulator"] = counter.most_common(1)[0][0]
                         groups.pop(j)
                         merged = True
                         break
@@ -489,8 +555,12 @@ class DocumentImporter:
                     from .utils import format_amount
                     amount_str = f" | 预估金额: {format_amount(g['amount'])}"
 
+                regulator_str = ""
+                if g.get("suggested_regulator"):
+                    regulator_str = f" | 建议监管部门: {g['suggested_regulator']}"
+
                 _print(f"\n  组{g['id']} [{g['display_name']}]:")
-                _print(f"    类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}")
+                _print(f"    类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}{regulator_str}")
                 _print(f"    文件 ({len(g['files'])} 个):")
                 for f in g["files"]:
                     type_icon = {"penalty": "📄", "defense": "💬", "rectification": "📋"}.get(f["type"], "📎")
@@ -597,6 +667,14 @@ class DocumentImporter:
             g1["amount"] = g2["amount"]
         if not g1["summary"] and g2["summary"]:
             g1["summary"] = g2["summary"]
+        merged_regulators = []
+        if g1.get("suggested_regulator"):
+            merged_regulators.append(g1["suggested_regulator"])
+        if g2.get("suggested_regulator"):
+            merged_regulators.append(g2["suggested_regulator"])
+        if merged_regulators:
+            counter = Counter(merged_regulators)
+            g1["suggested_regulator"] = counter.most_common(1)[0][0]
 
         groups = [g for g in groups if g["id"] != id2]
         return self._renumber_groups(groups)
@@ -611,6 +689,15 @@ class DocumentImporter:
 
         new_groups = []
         for i, f in enumerate(target["files"]):
+            suggested_regulator = None
+            if f["type"] == "penalty":
+                reg = self._extract_regulator_from_content(f["content"])
+                if reg:
+                    suggested_regulator = reg
+                else:
+                    reg_from_name = self._extract_regulator_from_content(f["name"])
+                    if reg_from_name:
+                        suggested_regulator = reg_from_name
             new_group = {
                 "id": 0,
                 "key": f"{target['key']}_split{i}",
@@ -622,6 +709,7 @@ class DocumentImporter:
                 "has_rectification": f["type"] == "rectification",
                 "amount": target.get("amount") if i == 0 else None,
                 "summary": target.get("summary") if i == 0 else "",
+                "suggested_regulator": suggested_regulator,
             }
             new_groups.append(new_group)
 
@@ -629,13 +717,14 @@ class DocumentImporter:
         return self._renumber_groups(groups)
 
     def _refresh_group_stats(self, group: Dict):
-        """重新计算分组的统计信息（has_penalty/has_defense/has_rectification/amount）"""
+        """重新计算分组的统计信息（has_penalty/has_defense/has_rectification/amount/suggested_regulator）"""
         group["doc_types"] = {f["type"] for f in group["files"]}
         group["has_penalty"] = "penalty" in group["doc_types"]
         group["has_defense"] = "defense" in group["doc_types"]
         group["has_rectification"] = "rectification" in group["doc_types"]
         group["amount"] = None
         group["summary"] = ""
+        regulator_candidates = []
         for f in group["files"]:
             if f["type"] == "penalty":
                 if not group["amount"]:
@@ -644,6 +733,17 @@ class DocumentImporter:
                         group["amount"] = amount
                 if not group["summary"]:
                     group["summary"] = generate_summary(f["content"], 200)
+                reg = self._extract_regulator_from_content(f["content"])
+                if reg:
+                    regulator_candidates.append(reg)
+                reg_from_name = self._extract_regulator_from_content(f["name"])
+                if reg_from_name:
+                    regulator_candidates.append(reg_from_name)
+        if regulator_candidates:
+            counter = Counter(regulator_candidates)
+            group["suggested_regulator"] = counter.most_common(1)[0][0]
+        else:
+            group["suggested_regulator"] = None
 
     def _move_file_between_groups(self, groups: List[Dict],
                                   file_global_idx: int, target_id: int) -> List[Dict]:
@@ -747,9 +847,13 @@ class DocumentImporter:
                    + ("..." if len(case_data['source_files']) > 3 else ""))
 
             default_company = common_data.get("company", "")
+            default_regulator = group.get("suggested_regulator") or common_data.get("regulator", "")
             default_biz = common_data.get("business_line", "")
             default_tags = common_data.get("tags", [])
             default_date = common_data.get("penalty_date", "")
+
+            regulator = _input(f"  监管部门 [{default_regulator}]: ").strip()
+            case_data["regulator"] = regulator or default_regulator
 
             company = _input(f"  所属公司 [{default_company}]: ").strip()
             case_data["company"] = company or default_company

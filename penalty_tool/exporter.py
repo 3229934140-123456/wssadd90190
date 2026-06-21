@@ -832,6 +832,77 @@ class CaseExporter:
         lines = content.split("\n")
         return "\n".join([(prefix + line) if line else "" for line in lines])
 
+    def export_health_check_csv(self, issues: dict, output_path: str) -> str:
+        """
+        导出健康检查结果为CSV（按缺失类型+部门分组）
+
+        列: case_no, company, regulator, missing_fields,
+            penalty_date_new, penalty_amount_new, facts_new, tags_new
+        其中 *_new 列为空，供回填使用；missing_fields 用 "|" 分隔。
+        """
+        import csv
+        from collections import defaultdict
+
+        all_cases = defaultdict(set)
+        label_map = {
+            "missing_date": "处罚日期",
+            "missing_amount": "处罚金额",
+            "missing_facts": "事实正文",
+            "missing_tags": "标签",
+        }
+
+        for key, label in label_map.items():
+            for item in issues.get(key, []):
+                cid = item.get("id")
+                if cid is not None:
+                    all_cases[cid].add(label)
+
+        case_info = {}
+        for key in label_map.keys():
+            for item in issues.get(key, []):
+                cid = item.get("id")
+                if cid is not None and cid not in case_info:
+                    case_info[cid] = {
+                        "case_no": item.get("case_no", ""),
+                        "company": item.get("company", ""),
+                        "regulator": item.get("regulator", ""),
+                    }
+
+        rows = []
+        for cid, missing_set in all_cases.items():
+            info = case_info.get(cid, {})
+            rows.append({
+                "case_no": info.get("case_no", ""),
+                "company": info.get("company", ""),
+                "regulator": info.get("regulator", ""),
+                "missing_fields": "|".join(sorted(missing_set)),
+                "penalty_date_new": "",
+                "penalty_amount_new": "",
+                "facts_new": "",
+                "tags_new": "",
+            })
+
+        def _sort_key(r):
+            return (r["regulator"], r["missing_fields"], r["case_no"])
+
+        rows.sort(key=_sort_key)
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        fieldnames = [
+            "case_no", "company", "regulator", "missing_fields",
+            "penalty_date_new", "penalty_amount_new", "facts_new", "tags_new",
+        ]
+
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        return os.path.abspath(output_path)
+
     def _write_file(self, path: str, content: str):
         """写入文件，自动创建目录"""
         output_dir = os.path.dirname(path)

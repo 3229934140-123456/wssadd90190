@@ -28,15 +28,17 @@ class PenaltyShell(cmd.Cmd):
 ║    import <文件夹>     - 批量导入处罚文档（智能分组+预览）      ║
 ║    list                - 列出所有案例                           ║
 ║    view <编号>         - 查看案例详情                           ║
+║    similar <编号>      - 查找相似案例                           ║
 ║    export <编号...>    - 导出参考清单（律师/业务/对比）          ║
 ║    check               - 资料库健康检查                        ║
+║    apply-check <csv>   - 批量导入健康检查回填                   ║
 ║    stats               - 查看数据库统计                        ║
 ║    help <命令>         - 查看命令详细帮助                       ║
 ║    quit / exit         - 退出工具                               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  高级搜索示例：                                                 ║
-║    search --min 10万 --max 50万 -r 市监局                      ║
-║    search 广告 --from 2024-01-01 --save 广告类案件              ║
+║    search -m 10万 -x 50万 -r 市监局                            ║
+║    search 广告 -f 2024-01-01 --save 广告类案件                  ║
 ║    search --use 广告类案件                                      ║
 ╚══════════════════════════════════════════════════════════════╝
     """
@@ -63,11 +65,11 @@ class PenaltyShell(cmd.Cmd):
   -c, --company <公司>       按所属公司过滤（模糊匹配）
   -r, --regulator <部门>     按监管部门过滤（模糊匹配）
   -b, --business <业务线>    按业务线过滤
-  -t, --tags <标签>          按标签过滤（多个标签用逗号分隔，AND关系）
-      --min <金额>           最低处罚金额（支持'10万'、'50000'等格式）
-      --max <金额>           最高处罚金额
-      --from <日期>          起始日期 YYYY-MM-DD
-      --to   <日期>          结束日期 YYYY-MM-DD
+  -g, --tags <标签>          按标签过滤（多个标签用逗号分隔，AND关系）
+  -m, --min <金额>           最低处罚金额（支持'10万'、'50000'等格式）
+  -x, --max <金额>           最高处罚金额
+  -f, --from <日期>          起始日期 YYYY-MM-DD
+  -t, --to   <日期>          结束日期 YYYY-MM-DD
       --sort <字段>          排序字段：date/amount/created（默认date）
       --order <方向>         排序方向：asc/desc（默认desc）
   -n, --limit <数量>         返回结果数量上限（默认50）
@@ -78,9 +80,9 @@ class PenaltyShell(cmd.Cmd):
 
 示例：
   search                                    # 无条件，列出全部
-  search --min 10万 --max 50万 -r 市监局     # 纯筛选
+  search -m 10万 -x 50万 -r 市监局          # 纯筛选
   search 广告绝对化用语
-  search 个人信息 -t 数据合规 --save 数据合规案件
+  search 个人信息 -g 数据合规 --save 数据合规案件
   search --use 数据合规案件
         """
         args = self._parse_search_args(arg)
@@ -150,6 +152,10 @@ class PenaltyShell(cmd.Cmd):
             args["from_date"] = preset["from_date"]
         if not args["to_date"] and preset.get("to_date"):
             args["to_date"] = preset["to_date"]
+        if args.get("sort_by") == "penalty_date" and preset.get("sort_by"):
+            args["sort_by"] = preset["sort_by"]
+        if args.get("sort_order") == "desc" and preset.get("sort_order"):
+            args["sort_order"] = preset["sort_order"]
         print(f"  ✓ 已加载检索预设，条件已合并")
 
     def _save_current_search(self, args: dict):
@@ -239,19 +245,19 @@ class PenaltyShell(cmd.Cmd):
             elif p in ("-b", "--business") and i + 1 < len(parts):
                 business_line = parts[i + 1]
                 i += 2
-            elif p in ("-t", "--tags") and i + 1 < len(parts):
+            elif p in ("-g", "--tags") and i + 1 < len(parts):
                 tags = parse_input_list(parts[i + 1])
                 i += 2
-            elif p == "--min" and i + 1 < len(parts):
+            elif p in ("-m", "--min") and i + 1 < len(parts):
                 min_amount = self._parse_amount(parts[i + 1])
                 i += 2
-            elif p == "--max" and i + 1 < len(parts):
+            elif p in ("-x", "--max") and i + 1 < len(parts):
                 max_amount = self._parse_amount(parts[i + 1])
                 i += 2
-            elif p == "--from" and i + 1 < len(parts):
+            elif p in ("-f", "--from") and i + 1 < len(parts):
                 from_date = self._normalize_date(parts[i + 1])
                 i += 2
-            elif p == "--to" and i + 1 < len(parts):
+            elif p in ("-t", "--to") and i + 1 < len(parts):
                 to_date = self._normalize_date(parts[i + 1])
                 i += 2
             elif p == "--sort" and i + 1 < len(parts):
@@ -457,6 +463,65 @@ class PenaltyShell(cmd.Cmd):
         output = self.searcher.format_case_detail(case_id, highlight=self._last_keywords)
         print(output)
 
+    # ============ similar 命令 ============
+    def do_similar(self, arg: str):
+        """查找相似案例：similar <编号> 或 similar <案例编号>
+
+查找与指定案例最相似的其他案例，按多维度综合评分排序。
+
+示例：
+  similar 1           （基于上次搜索/列表中第1条查找）
+  similar TECH-2024-0001  （按案例号查找）
+        """
+        target = arg.strip()
+        if not target:
+            print("  ! 请指定要查找的编号或案例号")
+            return
+
+        case_id = None
+        try:
+            idx = int(target)
+            if 1 <= idx <= len(self._last_results):
+                case_id = self._last_results[idx - 1]["id"]
+            else:
+                print(f"  ! 编号超出范围 (当前有 {len(self._last_results)} 条结果)")
+                return
+        except ValueError:
+            case = self.db.get_case_by_no(target)
+            if case:
+                case_id = case["id"]
+            else:
+                print(f"  ! 未找到案例: {target}")
+                return
+
+        results = self.db.find_similar_cases(case_id, limit=10)
+        self._last_results = results
+
+        if not results:
+            print("  ! 未找到相似案例")
+            return
+
+        target_case = self.db.get_case_by_id(case_id)
+        target_info = f"{target_case.get('case_no', '')} / {target_case.get('company', '')}" if target_case else target
+
+        print()
+        print("=" * 72)
+        print(f"  相似案例查找（基于: {target_info}）")
+        print("=" * 72)
+        print(f"  {'#':>3}  {'分数':>6}  {'案例编号':<18}  {'公司':<16}  {'金额':>10}  {'部门'}")
+        print("-" * 72)
+
+        for i, r in enumerate(results, 1):
+            amount = format_amount(r.get("penalty_amount", 0))
+            print(f"  {i:>3}  {r['score']:>6.2f}  {r['case_no']:<18}  {r['company']:<16}  {amount:>10}  {r['regulator']}")
+            if r.get("reasons"):
+                for reason in r["reasons"]:
+                    print(f"         └ {reason}")
+
+        print("=" * 72)
+        print(f"  共找到 {len(results)} 个相似案例（结果已保存，可直接 export/view）")
+        print()
+
     # ============ export 命令 ============
     def do_export(self, arg: str):
         """导出案例：export <编号列表> [选项]
@@ -601,12 +666,13 @@ class PenaltyShell(cmd.Cmd):
 检查资料库中缺失关键字段的案例，帮助发现数据空白。
 
 选项：
-  -o, --output <路径>     将检查结果导出为文件（支持.md/.txt/.json）
+  -o, --output <路径>     将检查结果导出为文件（支持.md/.txt/.json/.csv）
   -f, --fix               交互式修复缺失字段
 
 示例：
   check
   check -o ./数据质量检查.md
+  check -o ./数据质量检查.csv
   check -f
         """
         issues = self.db.health_check()
@@ -671,7 +737,9 @@ class PenaltyShell(cmd.Cmd):
             ext = os.path.splitext(output_path)[1].lower()
             summary = issues["summary"]
 
-            if ext == ".json":
+            if ext == ".csv":
+                result_path = self.exporter.export_health_check_csv(issues, output_path)
+            elif ext == ".json":
                 import json
                 export_data = {
                     "title": "资料库健康检查报告",
@@ -681,6 +749,7 @@ class PenaltyShell(cmd.Cmd):
                 }
                 with open(output_path, "w", encoding="utf-8") as f:
                     json.dump(export_data, f, ensure_ascii=False, indent=2)
+                result_path = os.path.abspath(output_path)
             else:
                 lines = []
                 lines.append("# 资料库健康检查报告")
@@ -713,8 +782,9 @@ class PenaltyShell(cmd.Cmd):
                 content = "\n".join(lines)
                 with open(output_path, "w", encoding="utf-8") as f:
                     f.write(content)
+                result_path = os.path.abspath(output_path)
 
-            print(f"  ✓ 检查结果已导出: {os.path.abspath(output_path)}")
+            print(f"  ✓ 检查结果已导出: {result_path}")
         except Exception as e:
             print(f"  ! 导出失败: {e}")
 
@@ -829,6 +899,35 @@ class PenaltyShell(cmd.Cmd):
             cursor = conn.cursor()
             cursor.execute(sql, params)
             conn.commit()
+
+    # ============ apply-check 命令 ============
+    def do_apply_check(self, arg: str):
+        """批量导入健康检查回填：apply-check <csv_path>
+
+读取健康检查导出的CSV，根据 case_no 批量更新非空的 *_new 列字段。
+
+示例：
+  apply-check ./data/health_check_backfill.csv
+        """
+        csv_path = arg.strip().strip('"').strip("'")
+        if not csv_path:
+            print("  ! 请指定 CSV 文件路径")
+            return
+
+        if not os.path.exists(csv_path):
+            print(f"  ! 文件不存在: {csv_path}")
+            return
+
+        print(f"  正在读取 CSV: {csv_path}")
+        updated_count, errors = self.db.batch_update_from_csv(csv_path)
+
+        print()
+        print(f"  ✓ 成功更新: {updated_count} 个案例")
+        if errors:
+            print(f"  ! 错误 ({len(errors)} 条):")
+            for err in errors:
+                print(f"      - {err}")
+        print()
 
     # ============ stats 命令 ============
     def do_stats(self, arg: str):
@@ -948,10 +1047,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 使用示例：
   python main.py                          # 启动交互式模式
   python main.py search "广告绝对化用语"   # 直接搜索
-  python main.py search --min 10万 -r 市监局  # 纯筛选搜索
+  python main.py search -m 10万 -r 市监局  # 纯筛选搜索
   python main.py import ./cases_folder    # 直接导入
   python main.py export 1,3 -o out.md     # 直接导出
   python main.py check                    # 资料库健康检查
+  python main.py similar CASE-001         # 查找相似案例
         """
     )
 
@@ -966,11 +1066,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("-c", "--company", help="按公司过滤")
     search_parser.add_argument("-r", "--regulator", help="按监管部门过滤")
     search_parser.add_argument("-b", "--business", help="按业务线过滤")
-    search_parser.add_argument("-t", "--tags", help="按标签过滤（逗号分隔）")
-    search_parser.add_argument("--min-amount", help="最低处罚金额（元）")
-    search_parser.add_argument("--max-amount", help="最高处罚金额（元）")
-    search_parser.add_argument("--from-date", help="起始日期 YYYY-MM-DD")
-    search_parser.add_argument("--to-date", help="结束日期 YYYY-MM-DD")
+    search_parser.add_argument("-g", "--tags", help="按标签过滤（逗号分隔）")
+    search_parser.add_argument("-m", "--min", dest="min_amount", help="最低处罚金额（元）")
+    search_parser.add_argument("-x", "--max", dest="max_amount", help="最高处罚金额（元）")
+    search_parser.add_argument("-f", "--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    search_parser.add_argument("-t", "--to", dest="to_date", help="结束日期 YYYY-MM-DD")
     search_parser.add_argument("--sort", default="date",
                                choices=["date", "amount", "created", "company"],
                                help="排序字段（默认date）")
@@ -996,6 +1096,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     view_parser = subparsers.add_parser("view", help="查看案例详情")
     view_parser.add_argument("target", help="编号或案例号")
 
+    similar_parser = subparsers.add_parser("similar", help="查找相似案例")
+    similar_parser.add_argument("target", help="案例编号或案例号")
+    similar_parser.add_argument("-n", "--limit", type=int, default=10, help="返回数量上限（默认10）")
+
     export_parser = subparsers.add_parser("export", help="导出案例")
     export_parser.add_argument("selection", help="案例编号（如 1,3 或 2-5 或 CASE001）")
     export_parser.add_argument("-f", "--format", default="md",
@@ -1009,8 +1113,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stats", help="查看数据库统计")
 
     check_parser = subparsers.add_parser("check", help="资料库健康检查")
-    check_parser.add_argument("-o", "--output", help="导出检查结果文件路径")
+    check_parser.add_argument("-o", "--output", help="导出检查结果文件路径（支持.md/.txt/.json/.csv）")
     check_parser.add_argument("-f", "--fix", action="store_true", help="交互式修复缺失字段")
+
+    apply_check_parser = subparsers.add_parser("apply-check", help="批量导入健康检查回填CSV")
+    apply_check_parser.add_argument("csv_path", help="回填CSV文件路径")
 
     return parser
 
@@ -1075,6 +1182,22 @@ def run_cli():
                     args.business = preset["business_line"]
                 if not tags and preset.get("tags"):
                     tags = preset["tags"]
+                if args.min_amount is None and preset.get("min_amount") is not None:
+                    args.min_amount = preset["min_amount"]
+                if args.max_amount is None and preset.get("max_amount") is not None:
+                    args.max_amount = preset["max_amount"]
+                if not args.from_date and preset.get("from_date"):
+                    args.from_date = preset["from_date"]
+                if not args.to_date and preset.get("to_date"):
+                    args.to_date = preset["to_date"]
+                if args.sort == "date" and preset.get("sort_by"):
+                    sort_reverse_map = {
+                        "penalty_date": "date", "penalty_amount": "amount",
+                        "created_at": "created", "company": "company"
+                    }
+                    args.sort = sort_reverse_map.get(preset["sort_by"], "date")
+                if args.order == "desc" and preset.get("sort_order"):
+                    args.order = preset["sort_order"]
                 print(f"  ✓ 已加载检索预设 '{args.use}'")
 
         if args.list_presets:
@@ -1161,6 +1284,31 @@ def run_cli():
         else:
             print(f"错误：未找到案例 {target}")
             sys.exit(1)
+
+    elif command == "similar":
+        db = PenaltyDatabase(db_path)
+        target = args.target
+        case = db.get_case_by_no(target)
+        if not case:
+            print(f"错误：未找到案例 {target}")
+            sys.exit(1)
+
+        results = db.find_similar_cases(case["id"], limit=args.limit)
+        if not results:
+            print("未找到相似案例")
+            return
+
+        target_info = f"{case.get('case_no', '')} / {case.get('company', '')}"
+        print(f"\n相似案例查找（基于: {target_info}）")
+        print(f"{'#':>3}  {'分数':>6}  {'案例编号':<18}  {'公司':<16}  {'金额':>10}  {'部门'}")
+        print("-" * 72)
+        for i, r in enumerate(results, 1):
+            amount = format_amount(r.get("penalty_amount", 0))
+            print(f"{i:>3}  {r['score']:>6.2f}  {r['case_no']:<18}  {r['company']:<16}  {amount:>10}  {r['regulator']}")
+            if r.get("reasons"):
+                for reason in r["reasons"]:
+                    print(f"       └ {reason}")
+        print(f"\n共找到 {len(results)} 个相似案例")
 
     elif command == "export":
         db = PenaltyDatabase(db_path)
@@ -1250,6 +1398,23 @@ def run_cli():
         if args.output:
             shell_ref = PenaltyShell(db_path)
             shell_ref._export_check_results(issues, args.output)
+
+    elif command == "apply-check":
+        db = PenaltyDatabase(db_path)
+        csv_path = args.csv_path.strip().strip('"').strip("'")
+        if not os.path.exists(csv_path):
+            print(f"错误：文件不存在: {csv_path}")
+            sys.exit(1)
+
+        print(f"正在读取 CSV: {csv_path}")
+        updated_count, errors = db.batch_update_from_csv(csv_path)
+
+        print(f"\n成功更新: {updated_count} 个案例")
+        if errors:
+            print(f"错误 ({len(errors)} 条):")
+            for err in errors:
+                print(f"  - {err}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
