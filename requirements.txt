@@ -1,0 +1,6 @@
+# 可选依赖（纯txt/md文档导入无需安装）
+# 读取docx文件需要
+python-docx>=0.8.11
+
+# 读取pdf文件需要
+pdfplumber>=0.10.0

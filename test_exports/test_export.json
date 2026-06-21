@@ -1,0 +1,61 @@
+{
+  "title": "监管处罚案例参考清单",
+  "generated_at": "2026-06-22 00:27:57",
+  "case_count": 3,
+  "cases": [
+    {
+      "case_no": "XX数据-2024-0001",
+      "company": "XX数据服务有限公司",
+      "regulator": "XX市互联网信息办公室",
+      "business_line": "数据合规",
+      "tags": [
+        "个保法",
+        "告知同意"
+      ],
+      "penalty_date": "2024-05-15",
+      "penalty_amount": 500000.0,
+      "penalty_amount_formatted": "50万元",
+      "facts": "APP未以显著方式告知个人信息处理规则，申请权限未说明目的，违反最小必要原则。",
+      "result_summary": "因个人信息告知不充分被处罚50万元",
+      "defense_content": "",
+      "rectification_report": "",
+      "reference_script": "话术：'关于个人信息保护，我司严格遵循告知同意原则，确保用户知情权和选择权。'"
+    },
+    {
+      "case_no": "XX科技-2024-0001",
+      "company": "XX科技有限公司",
+      "regulator": "XX市市场监督管理局",
+      "business_line": "广告业务",
+      "tags": [
+        "广告法",
+        "绝对化用语"
+      ],
+      "penalty_date": "2024-04-20",
+      "penalty_amount": 200000.0,
+      "penalty_amount_formatted": "20万元",
+      "facts": "当事人在官网及电商平台使用'全网最低价'、'行业第一'等绝对化用语，违反广告法第九条。",
+      "result_summary": "因使用绝对化用语被处罚20万元，已整改完毕",
+      "defense_content": "当事人主动下架广告，系初次违法，请求从轻处罚。",
+      "rectification_report": "已建立三级审核制度，组织全员培训。",
+      "reference_script": "参考话术：'我司高度重视广告合规问题，已第一时间下架全部涉嫌违规内容，并建立了严格的广告内容审查机制。'"
+    },
+    {
+      "case_no": "XX商贸-2023-0001",
+      "company": "XX商贸有限公司",
+      "regulator": "XX市人社局",
+      "business_line": "人力资源",
+      "tags": [
+        "劳动合同法",
+        "书面合同"
+      ],
+      "penalty_date": "2023-11-28",
+      "penalty_amount": 385000.0,
+      "penalty_amount_formatted": "38.50万元",
+      "facts": "23名新员工中17人未在入职一月内签合同，8人超一年未签无固定期限合同。",
+      "result_summary": "17名员工未及时签劳动合同，处罚38.5万",
+      "defense_content": "",
+      "rectification_report": "",
+      "reference_script": ""
+    }
+  ]
+}
