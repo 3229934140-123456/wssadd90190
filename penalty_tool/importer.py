@@ -2,6 +2,7 @@
 
 import os
 import re
+from datetime import datetime
 from typing import List, Dict, Optional, Callable, Tuple
 from collections import Counter
 from .database import PenaltyDatabase
@@ -123,7 +124,27 @@ class DocumentImporter:
             if summary:
                 data["result_summary"] = summary
 
+        if not data.get("external_penalty_no"):
+            ext_no = self._extract_external_penalty_no(content)
+            if ext_no:
+                data["external_penalty_no"] = ext_no
+
         return data
+
+    def _extract_external_penalty_no(self, content: str) -> Optional[str]:
+        """
+        从文档内容中提取外部处罚文号
+        匹配格式如：市监罚字〔2024〕12号、沪市监静处〔2024〕001号、行政处罚决定书 文号：XXXX
+        """
+        if not content:
+            return None
+        pattern = r"[〔\[（(][一二三四五六七八九十百千\d]+[〔\[（(]?\d*[〕\]）)]?\d*号|文号[::]\s*([^\s，。；]+)"
+        match = re.search(pattern, content)
+        if match:
+            if match.group(1):
+                return match.group(1).strip()
+            return match.group(0).strip()
+        return None
 
     def _extract_regulator_from_content(self, content: str) -> Optional[str]:
         """
@@ -407,6 +428,7 @@ class DocumentImporter:
                     "amount": None,
                     "summary": "",
                     "suggested_regulator": None,
+                    "suggested_external_no": None,
                 }
 
             file_info = {
@@ -426,6 +448,10 @@ class DocumentImporter:
                         groups_dict[group_key]["amount"] = amount
                 if not groups_dict[group_key]["summary"]:
                     groups_dict[group_key]["summary"] = generate_summary(content, 200)
+                if not groups_dict[group_key]["suggested_external_no"]:
+                    ext_no = self._extract_external_penalty_no(content)
+                    if ext_no:
+                        groups_dict[group_key]["suggested_external_no"] = ext_no
             elif doc_type == "defense":
                 groups_dict[group_key]["has_defense"] = True
             elif doc_type == "rectification":
@@ -516,6 +542,8 @@ class DocumentImporter:
                             groups[i]["amount"] = groups[j]["amount"]
                         if not groups[i]["summary"] and groups[j]["summary"]:
                             groups[i]["summary"] = groups[j]["summary"]
+                        if not groups[i].get("suggested_external_no") and groups[j].get("suggested_external_no"):
+                            groups[i]["suggested_external_no"] = groups[j]["suggested_external_no"]
                         merged_regulators = []
                         if groups[i].get("suggested_regulator"):
                             merged_regulators.append(groups[i]["suggested_regulator"])
@@ -559,8 +587,12 @@ class DocumentImporter:
                 if g.get("suggested_regulator"):
                     regulator_str = f" | 建议监管部门: {g['suggested_regulator']}"
 
+                ext_no_str = ""
+                if g.get("suggested_external_no"):
+                    ext_no_str = f" | 建议文号: {g['suggested_external_no']}"
+
                 _print(f"\n  组{g['id']} [{g['display_name']}]:")
-                _print(f"    类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}{regulator_str}")
+                _print(f"    类型: {'/'.join(type_labels) if type_labels else '未知'}{amount_str}{regulator_str}{ext_no_str}")
                 _print(f"    文件 ({len(g['files'])} 个):")
                 for f in g["files"]:
                     type_icon = {"penalty": "📄", "defense": "💬", "rectification": "📋"}.get(f["type"], "📎")
@@ -667,6 +699,8 @@ class DocumentImporter:
             g1["amount"] = g2["amount"]
         if not g1["summary"] and g2["summary"]:
             g1["summary"] = g2["summary"]
+        if not g1.get("suggested_external_no") and g2.get("suggested_external_no"):
+            g1["suggested_external_no"] = g2["suggested_external_no"]
         merged_regulators = []
         if g1.get("suggested_regulator"):
             merged_regulators.append(g1["suggested_regulator"])
@@ -690,6 +724,7 @@ class DocumentImporter:
         new_groups = []
         for i, f in enumerate(target["files"]):
             suggested_regulator = None
+            suggested_external_no = None
             if f["type"] == "penalty":
                 reg = self._extract_regulator_from_content(f["content"])
                 if reg:
@@ -698,6 +733,9 @@ class DocumentImporter:
                     reg_from_name = self._extract_regulator_from_content(f["name"])
                     if reg_from_name:
                         suggested_regulator = reg_from_name
+                ext_no = self._extract_external_penalty_no(f["content"])
+                if ext_no:
+                    suggested_external_no = ext_no
             new_group = {
                 "id": 0,
                 "key": f"{target['key']}_split{i}",
@@ -710,6 +748,7 @@ class DocumentImporter:
                 "amount": target.get("amount") if i == 0 else None,
                 "summary": target.get("summary") if i == 0 else "",
                 "suggested_regulator": suggested_regulator,
+                "suggested_external_no": suggested_external_no,
             }
             new_groups.append(new_group)
 
@@ -717,13 +756,14 @@ class DocumentImporter:
         return self._renumber_groups(groups)
 
     def _refresh_group_stats(self, group: Dict):
-        """重新计算分组的统计信息（has_penalty/has_defense/has_rectification/amount/suggested_regulator）"""
+        """重新计算分组的统计信息（has_penalty/has_defense/has_rectification/amount/suggested_regulator/suggested_external_no）"""
         group["doc_types"] = {f["type"] for f in group["files"]}
         group["has_penalty"] = "penalty" in group["doc_types"]
         group["has_defense"] = "defense" in group["doc_types"]
         group["has_rectification"] = "rectification" in group["doc_types"]
         group["amount"] = None
         group["summary"] = ""
+        group["suggested_external_no"] = None
         regulator_candidates = []
         for f in group["files"]:
             if f["type"] == "penalty":
@@ -733,6 +773,10 @@ class DocumentImporter:
                         group["amount"] = amount
                 if not group["summary"]:
                     group["summary"] = generate_summary(f["content"], 200)
+                if not group["suggested_external_no"]:
+                    ext_no = self._extract_external_penalty_no(f["content"])
+                    if ext_no:
+                        group["suggested_external_no"] = ext_no
                 reg = self._extract_regulator_from_content(f["content"])
                 if reg:
                     regulator_candidates.append(reg)
@@ -851,6 +895,21 @@ class DocumentImporter:
             default_biz = common_data.get("business_line", "")
             default_tags = common_data.get("tags", [])
             default_date = common_data.get("penalty_date", "")
+
+            company_for_no = case_data.get("company") or default_company or "UNKNOWN"
+            year_for_no = (case_data.get("penalty_date") or default_date or datetime.now().strftime("%Y"))[:4]
+            auto_case_no = self.db._generate_case_no(company_for_no, year_for_no)
+
+            case_no_input = _input(f"  内部案例编号 [{auto_case_no}]: ").strip()
+            case_data["case_no"] = case_no_input or auto_case_no
+
+            default_ext_no = group.get("suggested_external_no") or case_data.get("external_penalty_no", "")
+            ext_no_prompt = f"  外部处罚文号 (如市监罚字〔2024〕001号, 回车留空)"
+            if default_ext_no:
+                ext_no_prompt += f" [{default_ext_no}]"
+            ext_no_prompt += ": "
+            ext_no_input = _input(ext_no_prompt).strip()
+            case_data["external_penalty_no"] = ext_no_input or default_ext_no
 
             regulator = _input(f"  监管部门 [{default_regulator}]: ").strip()
             case_data["regulator"] = regulator or default_regulator

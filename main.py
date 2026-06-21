@@ -498,7 +498,7 @@ class PenaltyShell(cmd.Cmd):
         self._last_results = results
 
         if not results:
-            print("  ! 未找到相似案例")
+            print("  ! 未找到足够相似的案例（可尝试调整标签/事实描述，或查看 stats 概览）")
             return
 
         target_case = self.db.get_case_by_id(case_id)
@@ -706,6 +706,10 @@ class PenaltyShell(cmd.Cmd):
 
         if not has_issues:
             print("  ✓ 所有案例数据完整，未发现缺失字段")
+        else:
+            print()
+            print("  💡 可导出 CSV 分派整理任务：使用 check -o xxx.csv")
+            print("     导出文件含批次号（监管部门-缺失类型）、负责人、状态、备注列，便于任务分派与跟踪")
         print("=" * 60)
 
         # 导出选项
@@ -739,6 +743,7 @@ class PenaltyShell(cmd.Cmd):
 
             if ext == ".csv":
                 result_path = self.exporter.export_health_check_csv(issues, output_path)
+                print("  已按监管部门+缺失类型分组，含批次号/负责人/状态/备注列")
             elif ext == ".json":
                 import json
                 export_data = {
@@ -919,13 +924,26 @@ class PenaltyShell(cmd.Cmd):
             return
 
         print(f"  正在读取 CSV: {csv_path}")
-        updated_count, errors = self.db.batch_update_from_csv(csv_path)
+        result = self.db.batch_update_from_csv(csv_path)
 
         print()
-        print(f"  ✓ 成功更新: {updated_count} 个案例")
-        if errors:
-            print(f"  ! 错误 ({len(errors)} 条):")
-            for err in errors:
+        if result["updated_count"] > 0:
+            print(f"  ✓ 已更新 {result['updated_count']} 个案例：")
+            for item in result["updated"]:
+                fields_str = ", ".join(item["updated_fields"])
+                print(f"    - {item['case_no']}: 更新字段({fields_str})")
+
+        if result["skipped_count"] > 0:
+            print(f"  ⚠ 跳过 {result['skipped_count']} 行：")
+            for item in result["skipped"]:
+                if item["case_no"]:
+                    print(f"    - 第 {item['row_num']} 行 {item['case_no']}: {item['reason']}")
+                else:
+                    print(f"    - 第 {item['row_num']} 行: {item['reason']}")
+
+        if result["errors"]:
+            print(f"  ! 错误 ({len(result['errors'])} 条):")
+            for err in result["errors"]:
                 print(f"      - {err}")
         print()
 
@@ -1295,7 +1313,7 @@ def run_cli():
 
         results = db.find_similar_cases(case["id"], limit=args.limit)
         if not results:
-            print("未找到相似案例")
+            print("  ! 未找到足够相似的案例（可尝试调整标签/事实描述，或查看 stats 概览）")
             return
 
         target_info = f"{case.get('case_no', '')} / {case.get('company', '')}"
@@ -1388,12 +1406,24 @@ def run_cli():
         issues = db.health_check()
         summary = issues["summary"]
 
+        has_issues = any([
+            summary["missing_date_count"],
+            summary["missing_amount_count"],
+            summary["missing_facts_count"],
+            summary["missing_tags_count"],
+        ])
+
         print(f"\n资料库健康检查")
         print(f"  案例总数: {summary['total_cases']}")
         print(f"  缺失处罚日期: {summary['missing_date_count']}")
         print(f"  缺失处罚金额: {summary['missing_amount_count']}")
         print(f"  缺失事实正文: {summary['missing_facts_count']}")
         print(f"  缺失标签: {summary['missing_tags_count']}")
+
+        if has_issues:
+            print()
+            print("可导出 CSV 分派整理任务：使用 check -o xxx.csv")
+            print("导出文件含批次号（监管部门-缺失类型）、负责人、状态、备注列，便于任务分派与跟踪")
 
         if args.output:
             shell_ref = PenaltyShell(db_path)
@@ -1407,12 +1437,26 @@ def run_cli():
             sys.exit(1)
 
         print(f"正在读取 CSV: {csv_path}")
-        updated_count, errors = db.batch_update_from_csv(csv_path)
+        result = db.batch_update_from_csv(csv_path)
 
-        print(f"\n成功更新: {updated_count} 个案例")
-        if errors:
-            print(f"错误 ({len(errors)} 条):")
-            for err in errors:
+        print()
+        if result["updated_count"] > 0:
+            print(f"✓ 已更新 {result['updated_count']} 个案例：")
+            for item in result["updated"]:
+                fields_str = ", ".join(item["updated_fields"])
+                print(f"  - {item['case_no']}: 更新字段({fields_str})")
+
+        if result["skipped_count"] > 0:
+            print(f"⚠ 跳过 {result['skipped_count']} 行：")
+            for item in result["skipped"]:
+                if item["case_no"]:
+                    print(f"  - 第 {item['row_num']} 行 {item['case_no']}: {item['reason']}")
+                else:
+                    print(f"  - 第 {item['row_num']} 行: {item['reason']}")
+
+        if result["errors"]:
+            print(f"错误 ({len(result['errors'])} 条):")
+            for err in result["errors"]:
                 print(f"  - {err}")
             sys.exit(1)
 

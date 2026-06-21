@@ -7,6 +7,25 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 
+class _BackwardCompatDict(dict):
+    """支持 dict 访问和 tuple 解包的兼容类，用于 batch_update_from_csv"""
+
+    def __init__(self, data: dict, legacy_tuple: Tuple):
+        super().__init__(data)
+        self._legacy_tuple = legacy_tuple
+
+    def __iter__(self):
+        return iter(self._legacy_tuple)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._legacy_tuple[key]
+        return super().__getitem__(key)
+
+    def __len__(self):
+        return len(self._legacy_tuple)
+
+
 class PenaltyDatabase:
     """处罚案例数据库管理类"""
 
@@ -48,10 +67,16 @@ class PenaltyDatabase:
                     internal_amount_analysis TEXT,
                     sensitive_contacts TEXT,
                     source_files TEXT,
+                    external_penalty_no TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
             """)
+
+            try:
+                cursor.execute("ALTER TABLE penalties ADD COLUMN external_penalty_no TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS case_tags (
@@ -133,14 +158,15 @@ class PenaltyDatabase:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT INTO penalties (
-                        case_no, company, regulator, business_line, tags,
+                        case_no, external_penalty_no, company, regulator, business_line, tags,
                         penalty_date, penalty_amount, result_summary,
                         facts, defense_content, rectification_report,
                         reference_script, internal_amount_analysis,
                         sensitive_contacts, source_files, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     case_no,
+                    case_data.get("external_penalty_no", ""),
                     case_data.get("company", ""),
                     case_data.get("regulator", ""),
                     case_data.get("business_line", ""),
@@ -218,9 +244,9 @@ class PenaltyDatabase:
                     (facts LIKE ? OR defense_content LIKE ? OR rectification_report LIKE ?
                      OR result_summary LIKE ? OR reference_script LIKE ? OR tags LIKE ?
                      OR case_no LIKE ? OR company LIKE ? OR regulator LIKE ?
-                     OR business_line LIKE ?)
+                     OR business_line LIKE ? OR external_penalty_no LIKE ?)
                 """)
-                params.extend([like_kw] * 10)
+                params.extend([like_kw] * 11)
             query_parts.append("(" + " AND ".join(keyword_conditions) + ")")
 
         if company:
@@ -272,7 +298,7 @@ class PenaltyDatabase:
         params.append(limit)
 
         sql = f"""
-            SELECT id, case_no, company, regulator, business_line, tags,
+            SELECT id, case_no, external_penalty_no, company, regulator, business_line, tags,
                    penalty_date, penalty_amount, result_summary,
                    facts, defense_content, rectification_report,
                    reference_script, created_at
@@ -403,7 +429,7 @@ class PenaltyDatabase:
         """获取用于导出的案例数据（简版，自动脱敏）"""
         placeholders = ",".join(["?"] * len(case_ids))
         sql = f"""
-            SELECT id, case_no, company, regulator, business_line, tags,
+            SELECT id, case_no, external_penalty_no, company, regulator, business_line, tags,
                    penalty_date, penalty_amount, result_summary,
                    facts, defense_content, rectification_report,
                    reference_script
@@ -432,7 +458,7 @@ class PenaltyDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT id, case_no, company, regulator, business_line, tags,
+                SELECT id, case_no, external_penalty_no, company, regulator, business_line, tags,
                        penalty_date, penalty_amount, result_summary, created_at
                 FROM penalties
                 ORDER BY created_at DESC
@@ -612,6 +638,7 @@ class PenaltyDatabase:
         Returns:
             按总分倒序的案例列表，每项包含：id, case_no, company, regulator,
             penalty_amount, score, reasons
+            只返回 score > 0 且 reasons 非空的案例。
         """
         import re
 
@@ -623,6 +650,9 @@ class PenaltyDatabase:
         target_regulator = (target.get("regulator") or "").strip()
         target_amount = float(target.get("penalty_amount") or 0)
         target_facts = target.get("facts") or ""
+
+        def _fmt_amount_wan(amount: float) -> str:
+            return f"{amount / 10000:.1f}"
 
         def _extract_chinese_words(text: str) -> set:
             if not text:
@@ -665,15 +695,16 @@ class PenaltyDatabase:
                     tag_score = tag_jaccard * 3
                     total_score += tag_score
                     if tag_score > 0:
-                        reasons.append(f"标签相似 ({', '.join(sorted(tag_inter)[:3])}) +{tag_score:.1f}")
+                        similar_tags = ", ".join(sorted(tag_inter)[:3])
+                        reasons.append(f"[标签] 相似标签：{similar_tags}，得分 +{tag_score:.1f}")
 
             if target_regulator and case_regulator:
                 if target_regulator == case_regulator:
                     total_score += 3
-                    reasons.append(f"监管部门相同 +3")
+                    reasons.append("[部门] 相同监管部门，得分 +3")
                 elif target_regulator in case_regulator or case_regulator in target_regulator:
                     total_score += 1
-                    reasons.append(f"监管部门相关 +1")
+                    reasons.append("[部门] 相关监管部门，得分 +1")
 
             denom = max(abs(target_amount), abs(case_amount), 1)
             amount_sim = 1 - abs(target_amount - case_amount) / denom
@@ -681,7 +712,10 @@ class PenaltyDatabase:
             amount_score = amount_sim * 3
             total_score += amount_score
             if amount_score > 0.5:
-                reasons.append(f"金额相近 +{amount_score:.1f}")
+                reasons.append(
+                    f"[金额] 金额相近（目标{_fmt_amount_wan(target_amount)}万 vs "
+                    f"当前{_fmt_amount_wan(case_amount)}万），得分 +{amount_score:.1f}"
+                )
 
             if target_fact_words and case_fact_words:
                 word_inter = target_fact_words & case_fact_words
@@ -691,24 +725,33 @@ class PenaltyDatabase:
                     word_score = word_jaccard * 3
                     total_score += word_score
                     if word_score > 0:
-                        reasons.append(f"事实关键词相似 ({', '.join(sorted(word_inter)[:3])}) +{word_score:.1f}")
+                        keywords = ", ".join(sorted(word_inter)[:3])
+                        reasons.append(f"[事实] 关键词重叠：{keywords}，得分 +{word_score:.1f}")
 
-            scored.append({
-                "id": item["id"],
-                "case_no": item.get("case_no", ""),
-                "company": item.get("company", ""),
-                "regulator": case_regulator,
-                "penalty_amount": case_amount,
-                "score": round(total_score, 2),
-                "reasons": reasons,
-            })
+            has_non_amount_reason = any(
+                r.startswith(("[标签]", "[部门]", "[事实]")) for r in reasons
+            )
+            both_amount_negligible = target_amount <= 1 and case_amount <= 1
+            if both_amount_negligible and not has_non_amount_reason:
+                continue
+
+            if total_score >= 1.5 and len(reasons) >= 1:
+                scored.append({
+                    "id": item["id"],
+                    "case_no": item.get("case_no", ""),
+                    "company": item.get("company", ""),
+                    "regulator": case_regulator,
+                    "penalty_amount": case_amount,
+                    "score": round(total_score, 2),
+                    "reasons": reasons,
+                })
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
     # ========== 批量从CSV更新 ==========
 
-    def batch_update_from_csv(self, csv_path: str) -> Tuple[int, List[str]]:
+    def batch_update_from_csv(self, csv_path: str):
         """
         读取CSV，根据 case_no 查找案例，对每行非空的 *_new 列更新对应字段
 
@@ -719,15 +762,28 @@ class PenaltyDatabase:
           tags_new           -> tags（逗号分隔）
 
         Returns:
-            (updated_count, errors)
+            dict: {
+                "updated": [{"case_no": ..., "updated_fields": ["penalty_date", ...]}],
+                "skipped": [{"row_num": ..., "case_no": ..., "reason": ...}],
+                "updated_count": N,
+                "skipped_count": M,
+                "errors": [str]
+            }
+            同时支持 tuple 解包：(updated_count, errors) 以兼容旧代码
         """
         import csv
 
-        errors = []
-        updated_count = 0
+        result = {
+            "updated": [],
+            "skipped": [],
+            "updated_count": 0,
+            "skipped_count": 0,
+            "errors": [],
+        }
 
         if not os.path.exists(csv_path):
-            return 0, [f"CSV 文件不存在: {csv_path}"]
+            result["errors"].append(f"CSV 文件不存在: {csv_path}")
+            return _BackwardCompatDict(result, (result["updated_count"], result["errors"]))
 
         field_mapping = {
             "penalty_date_new": "penalty_date",
@@ -736,21 +792,39 @@ class PenaltyDatabase:
             "tags_new": "tags",
         }
 
+        field_label = {
+            "penalty_date": "处罚日期",
+            "penalty_amount": "处罚金额",
+            "facts": "事实正文",
+            "tags": "标签",
+        }
+
         try:
             with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.DictReader(f)
                 for row_num, row in enumerate(reader, start=2):
                     case_no = (row.get("case_no") or "").strip()
                     if not case_no:
-                        errors.append(f"第 {row_num} 行: case_no 为空，跳过")
+                        result["skipped"].append({
+                            "row_num": row_num,
+                            "case_no": "",
+                            "reason": "case_no 为空",
+                        })
+                        result["skipped_count"] += 1
                         continue
 
                     case = self.get_case_by_no(case_no)
                     if not case:
-                        errors.append(f"第 {row_num} 行: 未找到案例 {case_no}，跳过")
+                        result["skipped"].append({
+                            "row_num": row_num,
+                            "case_no": case_no,
+                            "reason": "未找到案例",
+                        })
+                        result["skipped_count"] += 1
                         continue
 
                     updates = {}
+                    updated_fields_display = []
                     for csv_col, db_field in field_mapping.items():
                         val = row.get(csv_col)
                         if val is None:
@@ -765,21 +839,35 @@ class PenaltyDatabase:
                                     updates[db_field] = float(val_clean[:-1]) * 10000
                                 else:
                                     updates[db_field] = float(val_clean)
+                                updated_fields_display.append(field_label.get(db_field, db_field))
                             except ValueError:
-                                errors.append(f"第 {row_num} 行 ({case_no}): 金额格式错误 '{val}'，跳过该字段")
+                                result["errors"].append(f"第 {row_num} 行 ({case_no}): 金额格式错误 '{val}'，跳过该字段")
                                 continue
                         elif db_field == "tags":
                             updates[db_field] = [t.strip() for t in val.replace("，", ",").split(",") if t.strip()]
+                            updated_fields_display.append(field_label.get(db_field, db_field))
                         else:
                             updates[db_field] = val
+                            updated_fields_display.append(field_label.get(db_field, db_field))
 
                     if updates:
                         self._update_case_fields_internal(case["id"], updates)
-                        updated_count += 1
+                        result["updated"].append({
+                            "case_no": case_no,
+                            "updated_fields": updated_fields_display,
+                        })
+                        result["updated_count"] += 1
+                    else:
+                        result["skipped"].append({
+                            "row_num": row_num,
+                            "case_no": case_no,
+                            "reason": "未填写任何更新字段",
+                        })
+                        result["skipped_count"] += 1
         except Exception as e:
-            errors.append(f"读取 CSV 失败: {e}")
+            result["errors"].append(f"读取 CSV 失败: {e}")
 
-        return updated_count, errors
+        return _BackwardCompatDict(result, (result["updated_count"], result["errors"]))
 
     def _update_case_fields_internal(self, case_id: int, updates: dict):
         """内部方法：更新案例字段（与 main.py 中 _update_case_fields 类似）"""

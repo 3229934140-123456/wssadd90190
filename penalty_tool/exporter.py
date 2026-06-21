@@ -834,64 +834,102 @@ class CaseExporter:
 
     def export_health_check_csv(self, issues: dict, output_path: str) -> str:
         """
-        导出健康检查结果为CSV（按缺失类型+部门分组）
+        导出健康检查结果为CSV（整理任务清单格式）
 
-        列: case_no, company, regulator, missing_fields,
-            penalty_date_new, penalty_amount_new, facts_new, tags_new
-        其中 *_new 列为空，供回填使用；missing_fields 用 "|" 分隔。
+        列: batch_no, assignee, status, remarks, case_no, company, regulator,
+            missing_fields, penalty_date_new, penalty_amount_new, facts_new, tags_new
+
+        - batch_no: 按 "监管部门-缺失类型" 生成任务批次号
+        - 缺失类型顺序：缺日期、缺金额、缺事实、缺标签
+        - 排序：先按监管部门、再按缺失类型排
         """
         import csv
         from collections import defaultdict
 
-        all_cases = defaultdict(set)
-        label_map = {
+        missing_type_order = ["missing_date", "missing_amount", "missing_facts", "missing_tags"]
+        missing_type_label = {
+            "missing_date": "缺日期",
+            "missing_amount": "缺金额",
+            "missing_facts": "缺事实",
+            "missing_tags": "缺标签",
+        }
+        field_label = {
             "missing_date": "处罚日期",
             "missing_amount": "处罚金额",
             "missing_facts": "事实正文",
             "missing_tags": "标签",
         }
 
-        for key, label in label_map.items():
-            for item in issues.get(key, []):
-                cid = item.get("id")
-                if cid is not None:
-                    all_cases[cid].add(label)
-
+        all_cases = defaultdict(set)
         case_info = {}
-        for key in label_map.keys():
-            for item in issues.get(key, []):
+
+        for mtype in missing_type_order:
+            for item in issues.get(mtype, []):
                 cid = item.get("id")
-                if cid is not None and cid not in case_info:
+                if cid is None:
+                    continue
+                all_cases[cid].add(mtype)
+                if cid not in case_info:
                     case_info[cid] = {
                         "case_no": item.get("case_no", ""),
                         "company": item.get("company", ""),
                         "regulator": item.get("regulator", ""),
                     }
 
+        def _primary_missing_type(missing_set):
+            for mtype in missing_type_order:
+                if mtype in missing_set:
+                    return mtype
+            return missing_type_order[-1]
+
+        def _missing_fields_display(missing_set):
+            labels = []
+            for mtype in missing_type_order:
+                if mtype in missing_set:
+                    labels.append(field_label[mtype])
+            return "|".join(labels)
+
         rows = []
         for cid, missing_set in all_cases.items():
             info = case_info.get(cid, {})
+            primary = _primary_missing_type(missing_set)
+            regulator = info.get("regulator", "") or "未知部门"
             rows.append({
+                "_regulator": regulator,
+                "_primary_type": primary,
+                "_primary_order": missing_type_order.index(primary),
                 "case_no": info.get("case_no", ""),
                 "company": info.get("company", ""),
-                "regulator": info.get("regulator", ""),
-                "missing_fields": "|".join(sorted(missing_set)),
+                "regulator": regulator,
+                "missing_fields": _missing_fields_display(missing_set),
                 "penalty_date_new": "",
                 "penalty_amount_new": "",
                 "facts_new": "",
                 "tags_new": "",
             })
 
-        def _sort_key(r):
-            return (r["regulator"], r["missing_fields"], r["case_no"])
+        rows.sort(key=lambda r: (r["_regulator"], r["_primary_order"], r["case_no"]))
 
-        rows.sort(key=_sort_key)
+        last_batch_key = None
+        for r in rows:
+            batch_key = (r["_regulator"], r["_primary_type"])
+            if batch_key != last_batch_key:
+                batch_no = f'{r["_regulator"]}-{missing_type_label[r["_primary_type"]]}'
+                last_batch_key = batch_key
+            r["batch_no"] = batch_no
+            r["assignee"] = ""
+            r["status"] = "待处理"
+            r["remarks"] = ""
+            del r["_regulator"]
+            del r["_primary_type"]
+            del r["_primary_order"]
 
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
         fieldnames = [
+            "batch_no", "assignee", "status", "remarks",
             "case_no", "company", "regulator", "missing_fields",
             "penalty_date_new", "penalty_amount_new", "facts_new", "tags_new",
         ]
