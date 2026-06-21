@@ -1,4 +1,4 @@
-"""搜索模块 - 支持多关键词搜索、结果展示和高亮"""
+"""搜索模块 - 支持多关键词搜索、多维过滤、结果展示和高亮"""
 
 from typing import List, Dict, Optional, Tuple
 from .database import PenaltyDatabase
@@ -17,7 +17,14 @@ class CaseSearcher:
                company: Optional[str] = None,
                regulator: Optional[str] = None,
                business_line: Optional[str] = None,
-               tag: Optional[str] = None,
+               tags: Optional[List[str]] = None,
+               tag_str: Optional[str] = None,
+               min_amount: Optional[float] = None,
+               max_amount: Optional[float] = None,
+               from_date: Optional[str] = None,
+               to_date: Optional[str] = None,
+               sort_by: str = "penalty_date",
+               sort_order: str = "desc",
                limit: int = 50) -> List[Dict]:
         """
         搜索案例
@@ -28,21 +35,38 @@ class CaseSearcher:
             company: 按公司过滤
             regulator: 按监管部门过滤
             business_line: 按业务线过滤
-            tag: 按标签过滤
+            tags: 标签列表
+            tag_str: 标签字符串，会自动解析为列表
+            min_amount: 最低处罚金额（元）
+            max_amount: 最高处罚金额（元）
+            from_date: 起始日期 YYYY-MM-DD
+            to_date: 结束日期 YYYY-MM-DD
+            sort_by: 排序字段
+            sort_order: 排序方向
             limit: 返回结果数上限
         """
         if keyword_str:
             keywords = parse_input_list(keyword_str)
+        if tag_str:
+            tags = parse_input_list(tag_str)
 
         keywords = keywords or []
+        tags = tags or []
 
         results = self.db.search_keywords(
             keywords=keywords,
             company=company,
             regulator=regulator,
             business_line=business_line,
-            tag=tag,
-            limit=limit
+            tags=tags,
+            min_amount=min_amount,
+            max_amount=max_amount,
+            from_date=from_date,
+            to_date=to_date,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            limit=limit,
+            extract_snippets=True
         )
 
         for item in results:
@@ -50,7 +74,9 @@ class CaseSearcher:
 
         return results
 
-    def format_results_table(self, results: List[Dict], highlight: Optional[List[str]] = None) -> str:
+    def format_results_table(self, results: List[Dict],
+                             highlight: Optional[List[str]] = None,
+                             show_snippets: bool = True) -> str:
         """格式化搜索结果为表格显示"""
         if not results:
             return "未找到匹配的案例。请尝试调整关键词或过滤条件。"
@@ -76,20 +102,26 @@ class CaseSearcher:
             lines.append(f"         处罚日期: {item.get('penalty_date', '未知')}")
             lines.append(f"         处罚金额: {item.get('penalty_amount_formatted', '0元')}")
 
-            summary = item.get("result_summary", "") or item.get("facts", "")
-            if summary:
-                if highlight:
-                    summary = self._highlight_text(summary, highlight)
-                summary_display = (summary[:200] + "...") if len(summary) > 200 else summary
-                lines.append(f"         摘要    : {summary_display}")
+            if show_snippets and item.get("snippets"):
+                lines.append(f"         命中片段:")
+                for snip in item["snippets"]:
+                    lines.append(f"           [{snip['field']}] {snip['highlighted']}")
+            else:
+                summary = item.get("result_summary", "") or item.get("facts", "")
+                if summary:
+                    if highlight:
+                        summary = self._highlight_text(summary, highlight)
+                    summary_display = (summary[:120] + "...") if len(summary) > 120 else summary
+                    lines.append(f"         摘要    : {summary_display}")
 
             lines.append("  " + "-" * 96)
 
-        lines.append("\n  提示: 使用 'view <编号>' 查看详情，使用 'export <编号1,编号2...>' 导出")
+        lines.append("\n  提示: 直接输入编号查看详情 | 'export 1,3' 导出 | 'help search' 查看高级搜索选项")
 
         return "\n".join(lines)
 
-    def format_case_detail(self, case_id: int, highlight: Optional[List[str]] = None) -> str:
+    def format_case_detail(self, case_id: int,
+                           highlight: Optional[List[str]] = None) -> str:
         """格式化单个案例的详细信息"""
         case = self.db.get_case_by_id(case_id)
         if not case:
@@ -126,31 +158,40 @@ class CaseSearcher:
                 facts = self._highlight_text(facts, highlight)
             lines.append("")
             lines.append("  ┌─ 违法事实 ────────────────────────────────────────────────────────┐")
-            lines.append(self._wrap_text(facts[:2000], 68, "  │ "))
-            if len(facts) > 2000:
+            lines.append(self._wrap_text(facts[:3000], 68, "  │ "))
+            if len(facts) > 3000:
                 lines.append("  │ ... (内容已截断)")
             lines.append("  └───────────────────────────────────────────────────────────────────┘")
 
         if case.get("defense_content"):
+            defense = case["defense_content"]
+            if highlight:
+                defense = self._highlight_text(defense, highlight)
             lines.append("")
             lines.append("  ┌─ 申辩意见 ────────────────────────────────────────────────────────┐")
-            lines.append(self._wrap_text(case["defense_content"][:2000], 68, "  │ "))
-            if len(case["defense_content"]) > 2000:
+            lines.append(self._wrap_text(defense[:2000], 68, "  │ "))
+            if len(defense) > 2000:
                 lines.append("  │ ... (内容已截断)")
             lines.append("  └───────────────────────────────────────────────────────────────────┘")
 
         if case.get("rectification_report"):
+            rectification = case["rectification_report"]
+            if highlight:
+                rectification = self._highlight_text(rectification, highlight)
             lines.append("")
             lines.append("  ┌─ 整改报告 ────────────────────────────────────────────────────────┐")
-            lines.append(self._wrap_text(case["rectification_report"][:2000], 68, "  │ "))
-            if len(case["rectification_report"]) > 2000:
+            lines.append(self._wrap_text(rectification[:2000], 68, "  │ "))
+            if len(rectification) > 2000:
                 lines.append("  │ ... (内容已截断)")
             lines.append("  └───────────────────────────────────────────────────────────────────┘")
 
         if case.get("reference_script"):
+            script = case["reference_script"]
+            if highlight:
+                script = self._highlight_text(script, highlight)
             lines.append("")
             lines.append("  ┌─ 可借鉴话术 ──────────────────────────────────────────────────────┐")
-            lines.append(self._wrap_text(case["reference_script"], 68, "  │ "))
+            lines.append(self._wrap_text(script, 68, "  │ "))
             lines.append("  └───────────────────────────────────────────────────────────────────┘")
 
         if case.get("source_files"):
@@ -163,14 +204,14 @@ class CaseSearcher:
         return "\n".join(lines)
 
     def _highlight_text(self, text: str, keywords: List[str]) -> str:
-        """简单文本高亮（使用大写标记或特殊符号）"""
+        """简单文本高亮（使用『』标记）"""
         import re
         result = text
         for kw in keywords:
             if not kw:
                 continue
             pattern = re.compile(re.escape(kw), re.IGNORECASE)
-            result = pattern.sub(lambda m: f"【{m.group()}】", result)
+            result = pattern.sub(lambda m: f"『{m.group()}』", result)
         return result
 
     def _wrap_text(self, text: str, width: int, prefix: str = "") -> str:
@@ -193,7 +234,8 @@ class CaseSearcher:
 
         return "\n".join(lines)
 
-    def get_case_ids_from_selection(self, selection_str: str, search_results: List[Dict]) -> Tuple[List[int], List[str]]:
+    def get_case_ids_from_selection(self, selection_str: str,
+                                    search_results: List[Dict]) -> Tuple[List[int], List[str]]:
         """
         从选择字符串中解析案例ID列表
 
@@ -211,7 +253,7 @@ class CaseSearcher:
         parts = [p.strip() for p in selection_str.replace("，", ",").split(",") if p.strip()]
 
         for part in parts:
-            if "-" in part and not part.startswith("-"):
+            if "-" in part and not part.startswith("-") and not part.endswith("-"):
                 try:
                     start_str, end_str = part.split("-", 1)
                     start = int(start_str)
@@ -227,7 +269,11 @@ class CaseSearcher:
                     if part in no_to_id:
                         ids.append(no_to_id[part])
                     else:
-                        errors.append(f"无效的编号范围: {part}")
+                        case = self.db.get_case_by_no(part)
+                        if case:
+                            ids.append(case["id"])
+                        else:
+                            errors.append(f"未找到案例: {part}")
             else:
                 try:
                     num = int(part)
@@ -247,3 +293,36 @@ class CaseSearcher:
 
         unique_ids = list(dict.fromkeys(ids))
         return unique_ids, errors
+
+    def parse_filter_args(self, args_str: str) -> Dict:
+        """从命令参数字符串解析高级过滤条件（供内部使用）"""
+        result = {
+            "min_amount": None,
+            "max_amount": None,
+            "from_date": None,
+            "to_date": None,
+            "sort_by": "penalty_date",
+            "sort_order": "desc",
+        }
+
+        import re
+
+        amount_match = re.search(r'金额[：:]\s*([\d\.]+)\s*[~-]\s*([\d\.]+)\s*万?', args_str)
+        if not amount_match:
+            amount_match = re.search(r'amount[:=]\s*([\d\.]+)\s*[~-]\s*([\d\.]+)', args_str, re.IGNORECASE)
+
+        date_match = re.search(
+            r'日期[：:]\s*(\d{4}[-/]\d{2}[-/]\d{2})\s*[~-]\s*(\d{4}[-/]\d{2}[-/]\d{2})',
+            args_str
+        )
+        if not date_match:
+            date_match = re.search(
+                r'date[:=]\s*(\d{4}[-/]\d{2}[-/]\d{2})\s*[~-]\s*(\d{4}[-/]\d{2}[-/]\d{2})',
+                args_str, re.IGNORECASE
+            )
+
+        sort_match = re.search(r'排序[：:]\s*(\w+)\s*(升序|降序)?', args_str)
+        if not sort_match:
+            sort_match = re.search(r'sort[:=]\s*(\w+)(\s+(asc|desc))?', args_str, re.IGNORECASE)
+
+        return result

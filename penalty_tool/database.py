@@ -153,16 +153,40 @@ class PenaltyDatabase:
         except Exception as e:
             return False, "", f"导入失败: {str(e)}"
 
-    def search_keywords(self, keywords: List[str],
+    def search_keywords(self, keywords: Optional[List[str]] = None,
                         company: Optional[str] = None,
                         regulator: Optional[str] = None,
                         business_line: Optional[str] = None,
-                        tag: Optional[str] = None,
-                        limit: int = 50) -> List[Dict]:
+                        tags: Optional[List[str]] = None,
+                        min_amount: Optional[float] = None,
+                        max_amount: Optional[float] = None,
+                        from_date: Optional[str] = None,
+                        to_date: Optional[str] = None,
+                        sort_by: str = "penalty_date",
+                        sort_order: str = "desc",
+                        limit: int = 50,
+                        extract_snippets: bool = True) -> List[Dict]:
         """
         关键词搜索：在事实、申辩意见、整改报告、摘要、标签中模糊匹配
-        支持多关键词（AND关系）
+        支持多关键词（AND关系）、金额区间、日期范围、多标签筛选
+
+        Args:
+            keywords: 关键词列表（AND关系）
+            company: 按公司过滤（模糊）
+            regulator: 按监管部门过滤（模糊）
+            business_line: 按业务线过滤（模糊）
+            tags: 标签列表（AND关系，模糊匹配）
+            min_amount: 最低处罚金额
+            max_amount: 最高处罚金额
+            from_date: 起始日期 YYYY-MM-DD
+            to_date: 结束日期 YYYY-MM-DD
+            sort_by: 排序字段 penalty_date/penalty_amount/created_at
+            sort_order: 排序方向 asc/desc
+            limit: 返回数量上限
+            extract_snippets: 是否提取命中片段
         """
+        keywords = keywords or []
+        tags = tags or []
         query_parts = []
         params = []
 
@@ -191,22 +215,50 @@ class PenaltyDatabase:
             query_parts.append("business_line LIKE ?")
             params.append(f"%{business_line}%")
 
-        if tag:
-            query_parts.append("""
-                id IN (SELECT case_id FROM case_tags WHERE tag LIKE ?)
-            """)
-            params.append(f"%{tag}%")
+        if tags:
+            for tag in tags:
+                query_parts.append("""
+                    id IN (SELECT case_id FROM case_tags WHERE tag LIKE ?)
+                """)
+                params.append(f"%{tag}%")
+
+        if min_amount is not None:
+            query_parts.append("penalty_amount >= ?")
+            params.append(float(min_amount))
+
+        if max_amount is not None:
+            query_parts.append("penalty_amount <= ?")
+            params.append(float(max_amount))
+
+        if from_date:
+            query_parts.append("penalty_date >= ?")
+            params.append(from_date)
+
+        if to_date:
+            query_parts.append("penalty_date <= ?")
+            params.append(to_date)
 
         where_clause = " AND ".join(query_parts) if query_parts else "1=1"
+
+        sort_fields = {
+            "penalty_date": "penalty_date",
+            "penalty_amount": "penalty_amount",
+            "created_at": "created_at",
+            "company": "company",
+        }
+        sort_field = sort_fields.get(sort_by, "penalty_date")
+        sort_dir = "DESC" if sort_order.lower() == "desc" else "ASC"
+
         params.append(limit)
 
         sql = f"""
             SELECT id, case_no, company, regulator, business_line, tags,
                    penalty_date, penalty_amount, result_summary,
-                   facts, reference_script, created_at
+                   facts, defense_content, rectification_report,
+                   reference_script, created_at
             FROM penalties
             WHERE {where_clause}
-            ORDER BY penalty_date DESC, created_at DESC
+            ORDER BY {sort_field} {sort_dir}, created_at DESC
             LIMIT ?
         """
 
@@ -222,8 +274,76 @@ class PenaltyDatabase:
                         item["tags"] = json.loads(item["tags"])
                     except:
                         item["tags"] = []
+
+                if extract_snippets and keywords:
+                    item["snippets"] = self._extract_snippets(
+                        item, keywords, max_snippets=3, snippet_length=80
+                    )
+                else:
+                    item["snippets"] = []
+
                 results.append(item)
             return results
+
+    def _extract_snippets(self, case_data: Dict, keywords: List[str],
+                          max_snippets: int = 3, snippet_length: int = 80) -> List[Dict]:
+        """从案例文本中提取关键词命中片段"""
+        import re
+
+        search_fields = [
+            ("违法事实", case_data.get("facts", "")),
+            ("处理结果", case_data.get("result_summary", "")),
+            ("申辩意见", case_data.get("defense_content", "")),
+            ("整改报告", case_data.get("rectification_report", "")),
+            ("可借鉴话术", case_data.get("reference_script", "")),
+        ]
+
+        snippets = []
+        seen_positions = set()
+
+        for field_name, content in search_fields:
+            if not content:
+                continue
+
+            for kw in keywords:
+                if not kw:
+                    continue
+                pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                for match in pattern.finditer(content):
+                    start = max(0, match.start() - snippet_length // 2)
+                    end = min(len(content), match.end() + snippet_length // 2)
+
+                    snippet_key = (field_name, start // 20)
+                    if snippet_key in seen_positions:
+                        continue
+                    seen_positions.add(snippet_key)
+
+                    prefix = "..." if start > 0 else ""
+                    suffix = "..." if end < len(content) else ""
+
+                    snippet_text = prefix + content[start:end] + suffix
+                    snippet_text = re.sub(r"\s+", " ", snippet_text).strip()
+
+                    highlighted = snippet_text
+                    for k in keywords:
+                        highlighted = re.sub(
+                            re.escape(k),
+                            lambda m: f"『{m.group()}』",
+                            highlighted,
+                            flags=re.IGNORECASE
+                        )
+
+                    snippets.append({
+                        "field": field_name,
+                        "text": snippet_text,
+                        "highlighted": highlighted,
+                        "keyword": kw,
+                    })
+
+                    if len(snippets) >= max_snippets:
+                        return snippets
+
+        return snippets
 
     def get_case_by_id(self, case_id: int) -> Optional[Dict]:
         """根据ID获取完整案例信息"""
